@@ -6,27 +6,67 @@
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include "SimpleFSM.h"
+#include <Bounce2.h>
 #define JSON_CONFIG_FILE "/config.json"
+Bounce2::Button buttonDown = Bounce2::Button();
+Bounce2::Button buttonUp = Bounce2::Button();
+#define BUTTON_DOWN_PIN 21 // GIOP21 pin connected to down button
+#define BUTTON_UP_PIN 22 // GIOP21 pin connected to up button
+#define DEBOUNCE_TIME  50 // the debounce time in millisecond, increase this time if it still chatters
+
+
+// Create AsyncWebServer object on port 80
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// GPIO pin of 48V winch power
+int switchPin = 19;
+
+int InterruptCounter, rpm;
 
 SimpleFSM fsm;
-
-void on_break() {
-  Serial.println("winch motor state: BREAKING");
-}
-
-void on_spinForward() {
-  Serial.println("winch motor state: spinning FORWARD");
-}
-
-void on_spinBackward() {
-  Serial.println("winch motor state: spinning BACKWARD");
-}
+void on_break();
+void on_spinForward();
+void on_spinBackward();
 
 State s[] = {
   State("break",  on_break, NULL, NULL),
   State("spinForward",   on_spinForward, NULL, NULL),
   State("spinBackward",   on_spinBackward, NULL, NULL)
 };
+
+String getState() {
+    StaticJsonDocument<100> json;
+    int wantedpos;
+    for (int i = 0; i < sizeof(s); i++) {
+      if (fsm.getState() == &s[i]) {
+         wantedpos = i;
+         break;
+      }   
+    }
+    json["controllerState"] = wantedpos;
+    json["chainOut"] = 0;
+    json["rpm"] = rpm;
+    json["mainSwitch"] = digitalRead(switchPin);
+    String response;
+    serializeJson(json, response);
+    return response;
+}
+
+void on_break() {
+  Serial.println("winch motor state: BREAKING");
+  ws.textAll(getState());
+}
+
+void on_spinForward() {
+  Serial.println("winch motor state: spinning FORWARD");
+  ws.textAll(getState());
+}
+
+void on_spinBackward() {
+  Serial.println("winch motor state: spinning BACKWARD");
+  ws.textAll(getState());
+}
 
 enum triggers {
   forward = 1,
@@ -42,12 +82,6 @@ Transition transitions[] = {
 };
 
 int num_transitions = sizeof(transitions) / sizeof(Transition);
-
-const char* PARAM_INPUT_1 = "output";
-const char* PARAM_INPUT_2 = "state";
-
-// GPIO pin of 48V winch power
-int switchPin = 19;
 
 // the GPIO number of the winch PWM
 int pwmPin = 25;
@@ -67,11 +101,8 @@ unsigned long currentTime = millis();
 // Previous time
 unsigned long previousTime = 0; 
 
-int InterruptCounter, rpm;
-
 String sliderValue = "0";
 String rpmValue = "0";
-const char* PARAM_INPUT = "value";
 
 //flag for saving data
 bool shouldSaveConfig = false;
@@ -84,65 +115,93 @@ const char index_html[] PROGMEM = R"rawliteral(
     <title>Anchor Winch Control</title>
     <style>
       html {font-family: Arial; display: inline-block; text-align: center;}
-      h2 {font-size: 2.3rem;}
+      .topnav {overflow: hidden;background-color: #143642;}
+      h1 {font-size: 1.8rem;color: white;}
+      h2{font-size: 1.5rem;font-weight: bold;color: #143642;}
       p {font-size: 1.9rem;}
       body {max-width: 400px; margin:0px auto; padding-bottom: 25px;}
       .slider { -webkit-appearance: none; margin: 14px; width: 360px; height: 25px; background: #FFD65C;
         outline: none; -webkit-transition: .2s; transition: opacity .2s;}
       .slider::-webkit-slider-thumb {-webkit-appearance: none; appearance: none; width: 35px; height: 35px; background: #003249; cursor: pointer;}
       .slider::-moz-range-thumb { width: 35px; height: 35px; background: #003249; cursor: pointer; } 
+      button {padding: 15px 50px;font-size: 24px;text-align: center;outline: none;color: #fff;background-color: #0f8b8d;border: none;
+        border-radius: 5px;-webkit-touch-callout: none;-webkit-user-select: none;-khtml-user-select: none;-moz-user-select: none;
+        -ms-user-select: none;user-select: none;-webkit-tap-highlight-color: rgba(0,0,0,0);}
+      button:disabled,button[disabled]{background-color: #cccccc;color: #666666;}
     </style>
   </head>
   <body>
-    <h1>Anchor Winch Web Server</h1>
-    <p><input type="button" class="button" value="Down" onpointerdown="action(1)" onpointerup="action(3)"></p>
-    <p><input type="button" class="button" value="Stop" onpointerdown="action(3)"></p>
-    <p><input type="button" class="button" value="  Up  " onpointerdown="action(2)" onpointerup="action(3)"></p>
+    <div class="topnav"><h1>Anchor Winch Web Server</h1></div>
+    <p><button id="buttonDown" onpointerdown="ws.send('down')" onpointerup="ws.send('stop')">Down</button></p>
+    <p><button id="buttonStop" onpointerdown="ws.send('stop')">Stop</button></p>
+    <p><button id="buttonUp" onpointerdown="ws.send('up')" onpointerup="ws.send('stop')">Up</button></p>
     %SWITCH_PLACEHOLDER%
     %WINCH_PLACEHOLDER%
     <p>speed measured: <span id="winchRPM">0</span></p>
     <p>chain out: <span id="chainOut">0</span></p>
-    <p>controller state: <span id="contState">0</span></p>
     <script>
+      var gateway = `ws://${window.location.hostname}/ws`;
+      var ws;
+      window.addEventListener('load', onLoad);
+      function initWebSocket() {
+        console.log('Trying to open a WebSocket connection...');
+        ws = new WebSocket(gateway);
+        ws.onopen    = onOpen;
+        ws.onclose   = onClose;
+        ws.onmessage = onMessage; // <-- add this line
+      }
+      function onOpen(event) {
+        console.log('Connection opened');
+        ws.send('getStatus');
+      }
+      function onClose(event) {
+        console.log('Connection closed');
+        setTimeout(initWebSocket, 2000);
+      }
+      function onMessage(event) {
+        console.log(event.data);
+        const state = JSON.parse(event.data);
+        document.getElementById("winchRPM").textContent=state.rpm;
+        document.getElementById("chainOut").textContent=state.chainOut;
+        if (state.controllerState == 0) { // stop
+          document.getElementById('buttonUp').disabled = false;
+          document.getElementById('buttonDown').disabled = false;
+        }
+        if (state.controllerState == 1) { // forward
+          document.getElementById('buttonUp').disabled = true;
+          document.getElementById('buttonDown').disabled = false;
+        }
+        if (state.controllerState == 2) { // backward
+          document.getElementById('buttonUp').disabled = false;
+          document.getElementById('buttonDown').disabled = true;
+        }
+        
+        const switchElem = document.getElementById("mainSwitch");
+        if (switchElem.checked !== Boolean(state.mainSwitch)) {
+          isLocalChange = true;
+          switchElem.checked = !switchElem.checked;
+          isLocalChange = false;
+        }
+      }
+      function onLoad(event) {
+        initWebSocket();
+      }
       var isLocalChange = false;
       function updateSliderPWM(gpio, element) {
         var sliderValue = element.value;
         document.getElementById(`valueFor${element.id}`).innerHTML = sliderValue;
-        fetch("/slider?output="+gpio+"&state="+sliderValue);
+        ws.send("slider-"+sliderValue);
       }
       function toggleCheckbox(element) {
         if (!isLocalChange) {
-          fetch("/switch?output=mainSwitch&state=" + ((element.checked) ? 1 : 0));
+          ws.send((element.checked) ? 'switchHigh' : 'switchLow');
         }
       }
-      function action(value) {
-        fetch("/switch?output=fsm&state=" + value);
-      }
-      (async () => {
-        while (true) {
-          const jsonResponse = await fetch('/data')
-            .then(function(response) {
-              return response.json();
-            });
-          document.getElementById("winchRPM").textContent=jsonResponse.rpm;
-          document.getElementById("chainOut").textContent=jsonResponse.chainOut;
-          document.getElementById("contState").textContent=jsonResponse.controllerState;
-          const switchElem = document.getElementById("mainSwitch");
-          if (switchElem.checked !== Boolean(jsonResponse.mainSwitch)) {
-            isLocalChange = true;
-            switchElem.checked = !switchElem.checked;
-            isLocalChange = false;
-          }
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-      })();
     </script>
   </body>
 </html>
 )rawliteral";
 
-// Create AsyncWebServer object on port 80
-AsyncWebServer server(80);
 
 String outputState(int output) {
   if(digitalRead(output)){
@@ -261,6 +320,56 @@ void configModeCallback(WiFiManager *myWiFiManager) {
   Serial.println(WiFi.softAPIP());
 }
 
+
+void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
+  AwsFrameInfo *info = (AwsFrameInfo*)arg;
+  if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+    data[len] = 0;
+    char* dataStr = (char*)data;
+    if (strcmp(dataStr, "down") == 0) {
+      fsm.trigger(triggers::forward);
+    } else if (strcmp(dataStr, "up") == 0) {
+      fsm.trigger(triggers::backward);
+    } else if (strcmp(dataStr, "stop") == 0) {
+      fsm.trigger(triggers::stop);
+    } else {
+      if (strcmp(dataStr, "switchHigh") == 0) {
+        digitalWrite(switchPin, HIGH);
+      } else if (strcmp(dataStr, "switchLow") == 0) {
+        digitalWrite(switchPin, LOW);
+      } else if (strstr (dataStr, "slider-")) {
+        int val = atoi( &dataStr[7] );
+        Serial.printf("found slider value: %u \n", val);
+        ledcWrite(0, val);
+      }
+      ws.textAll(getState());
+    }
+  }
+}
+
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
+             void *arg, uint8_t *data, size_t len) {
+  switch (type) {
+    case WS_EVT_CONNECT:
+      Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+      break;
+    case WS_EVT_DISCONNECT:
+      Serial.printf("WebSocket client #%u disconnected\n", client->id());
+      break;
+    case WS_EVT_DATA:
+      handleWebSocketMessage(arg, data, len);
+      break;
+    case WS_EVT_PONG:
+    case WS_EVT_ERROR:
+      break;
+  }
+}
+
+void initWebSocket() {
+  ws.onEvent(onEvent);
+  server.addHandler(&ws);
+}
+
 void setup() {
 
   bool forceConfig = false;
@@ -360,6 +469,16 @@ void setup() {
 
   pinMode(tachoPin, INPUT);
 
+  buttonDown.attach( BUTTON_DOWN_PIN, INPUT_PULLUP ); // USE EXTERNAL PULL-UP
+  buttonUp.attach( BUTTON_UP_PIN, INPUT_PULLUP ); // USE EXTERNAL PULL-UP
+  // DEBOUNCE INTERVAL IN MILLISECONDS
+  buttonDown.interval(20); 
+  buttonUp.interval(20); 
+
+  // INDICATE THAT THE LOW STATE CORRESPONDS TO PHYSICALLY PRESSING THE BUTTON
+  buttonDown.setPressedState(LOW);
+  buttonUp.setPressedState(LOW);
+
   Serial.println("");
   Serial.println("WiFi connected");
   Serial.println("IP address: ");
@@ -397,73 +516,11 @@ void setup() {
     saveConfigFile();
   }
 
+  initWebSocket();
+
   // Route for root / web page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "text/html", index_html, processor);
-  });
-  // Send a GET request to <ESP_IP>/data
-  server.on("/data", HTTP_GET, [] (AsyncWebServerRequest *request) {
-    StaticJsonDocument<100> json;
-    int wantedpos;
-    for (int i = 0; i < sizeof(s); i++) {
-      if (fsm.getState() == &s[i]) {
-         wantedpos = i;
-         break;
-      }   
-    }
-    json["controllerState"] = wantedpos;
-    json["chainOut"] = 0;
-    json["rpm"] = rpm;
-    json["mainSwitch"] = digitalRead(switchPin);
-    String response;
-    serializeJson(json, response);
-    request->send(200, "application/json", response);
-  });
-  // Send a GET request to <ESP_IP>/switch?output=<inputMessage1>&state=<inputMessage2>
-  server.on("/switch", HTTP_GET, [] (AsyncWebServerRequest *request) {
-    String output;
-    String state;
-    // GET input1 value on <ESP_IP>/switch?output=<inputMessage1>&state=<inputMessage2>
-    if (request->hasParam(PARAM_INPUT_1) && request->hasParam(PARAM_INPUT_2)) {
-      output = request->getParam(PARAM_INPUT_1)->value();
-      state = request->getParam(PARAM_INPUT_2)->value();
-      if (output == "fsm") {
-        fsm.trigger(state.toInt());
-      } else {
-        digitalWrite(switchPin, state.toInt());
-      }
-    }
-    else {
-      output = "No message sent";
-      state = "No message sent";
-    }
-    Serial.print("GPIO: ");
-    Serial.print(output);
-    Serial.print(" - Set to: ");
-    Serial.println(state);
-    request->send(200, "text/plain", "OK");
-  });
-
-  // Send a GET request to <ESP_IP>/slider?output=<inputMessage1>&state=<inputMessage2>
-  server.on("/slider", HTTP_GET, [] (AsyncWebServerRequest *request) {
-    int pwmChannel;
-    String state;
-    // GET input1 value on <ESP_IP>/slider?output=<inputMessage1>&state=<inputMessage2>
-    if (request->hasParam(PARAM_INPUT_1) && request->hasParam(PARAM_INPUT_2)) {
-      pwmChannel = request->getParam(PARAM_INPUT_1)->value().toInt();
-      state = request->getParam(PARAM_INPUT_2)->value();
-      sliderValue = state;
-      ledcWrite(0, state.toInt());
-    }
-    else {
-      pwmChannel = 1337; // ERROR
-      state = "No message sent";
-    }
-    Serial.print("PWM channel: ");
-    Serial.print((pwmChannel > 255)? "no message sent": String(pwmChannel));
-    Serial.print(" - Set to: ");
-    Serial.println(state);
-    request->send(200, "text/plain", "OK");
   });
   server.begin();
 }
@@ -487,7 +544,21 @@ void meassure(int sensorIndex) {
 
 
 void loop(){
+  ws.cleanupClients();
   // meassure(0);
   // meassure(1);
   fsm.run();
+
+  buttonDown.update();
+  buttonUp.update();
+
+  if (buttonDown.pressed()) {
+    fsm.trigger(triggers::forward);
+  }
+  if (buttonUp.pressed()) {
+    fsm.trigger(triggers::backward);
+  }
+  if (buttonDown.released() || buttonUp.released()) {
+    fsm.trigger(triggers::stop);
+  }
 }
