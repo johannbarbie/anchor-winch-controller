@@ -7,23 +7,42 @@
 #include <ArduinoJson.h>
 #include "SimpleFSM.h"
 #include <Bounce2.h>
+#include "driver/ledc.h"
+#include "driver/pcnt.h"
+#include "soc/pcnt_struct.h"
 #define JSON_CONFIG_FILE "/config.json"
 Bounce2::Button buttonDown = Bounce2::Button();
 Bounce2::Button buttonUp = Bounce2::Button();
 #define BUTTON_DOWN_PIN 21 // GIOP21 pin connected to down button
 #define BUTTON_UP_PIN 22 // GIOP21 pin connected to up button
-#define DEBOUNCE_TIME  50 // the debounce time in millisecond, increase this time if it still chatters
-
+#define DEBOUNCE_TIME 5   // the debounce time in millisecond, increase this time if it still chatters
+#define PWM_FREQUENCY 150 // the frequency that the controller is expecting
+#define PWM_RESOLUTION 8 // in bits
+#define PWM_CHANNEL 0
+#define PCNT_PIN 25 // GIP of opto-in on sailor hat for counting speed pulses
 
 // Create AsyncWebServer object on port 80
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
 // GPIO pin of 48V winch power
-int switchPin = 19;
+int switchPin = 14;
+
+
+// setting PWM properties
+// the GPIO number of the winch PWM
+// we use the opto-out of the sailor hat
+int pwmPin = 33;
+int dutyCycle = 15; // a value from 0 to 255
+
+// forward / reverse
+int reversePin = 19;
+
 
 int InterruptCounter, rpm;
+volatile unsigned long pulseCount = 0;  // Count of PWM pulses
 
+// final state machine to manage different
 SimpleFSM fsm;
 void on_break();
 void on_spinForward();
@@ -55,16 +74,23 @@ String getState() {
 
 void on_break() {
   Serial.println("winch motor state: BREAKING");
+  ledcWrite(PWM_CHANNEL, 0);
   ws.textAll(getState());
 }
 
 void on_spinForward() {
   Serial.println("winch motor state: spinning FORWARD");
+  // reverse pin off
+  digitalWrite(reversePin, HIGH);
+  ledcWrite(PWM_CHANNEL, dutyCycle);
   ws.textAll(getState());
 }
 
 void on_spinBackward() {
   Serial.println("winch motor state: spinning BACKWARD");
+  digitalWrite(reversePin, LOW);
+  // reverse pin on
+  ledcWrite(PWM_CHANNEL, dutyCycle);
   ws.textAll(getState());
 }
 
@@ -83,26 +109,10 @@ Transition transitions[] = {
 
 int num_transitions = sizeof(transitions) / sizeof(Transition);
 
-// the GPIO number of the winch PWM
-int pwmPin = 25;
-
-// setting PWM properties
-int pwmFrequency= 25000;
-int pwmResolution = 8;
-
-// forward / reverse
-int reversePin = 0;
-
-// the GPIO numbers of the winch tacho
-int tachoPin = 2;
-
 // Current time
 unsigned long currentTime = millis();
 // Previous time
 unsigned long previousTime = 0; 
-
-String sliderValue = "0";
-String rpmValue = "0";
 
 //flag for saving data
 bool shouldSaveConfig = false;
@@ -136,7 +146,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     <p><button id="buttonStop" onpointerdown="ws.send('stop')">Stop</button></p>
     <p><button id="buttonUp" onpointerdown="ws.send('up')" onpointerup="ws.send('stop')">Up</button></p>
     %SWITCH_PLACEHOLDER%
-    %WINCH_PLACEHOLDER%
+    %SPEED_PLACEHOLDER%
     <p>speed measured: <span id="winchRPM">0</span></p>
     <p>chain out: <span id="chainOut">0</span></p>
     <script>
@@ -215,11 +225,11 @@ String outputState(int output) {
 // Replaces placeholders with dynamic html in the control page
 String processor(const String& var) {
   //Serial.println(var);
-  if(var == "WINCH_PLACEHOLDER"){
-    String winches = "";
-    winches += "<p>PWM speed set: <span id=\"valueForPwmSlider\">" + sliderValue + "</span></p>";
-    winches += String("<p><input type=\"range\" onchange=\"updateSliderPWM(") + String(pwmPin) + ", this)\" id=\"PwmSlider\" min=\"0\" max=\"255\" value=\"" + sliderValue + "\" step=\"1\" class=\"slider\"></p>";
-    return winches;
+  if(var == "SPEED_PLACEHOLDER"){
+    String speed = "";
+    speed += "<p>PWM speed set: <span id=\"valueForPwmSlider\">" + String(dutyCycle) + "</span></p>";
+    speed += String("<p><input type=\"range\" onchange=\"updateSliderPWM(") + String(pwmPin) + ", this)\" id=\"PwmSlider\" min=\"0\" max=\"255\" value=\"" + String(dutyCycle) + "\" step=\"1\" class=\"slider\"></p>";
+    return speed;
   }
   if(var == "SWITCH_PLACEHOLDER"){
     String buttons = "";
@@ -234,10 +244,7 @@ void saveConfigFile() {
   StaticJsonDocument<512> json;
   json["switchPin"] = switchPin;
   json["pwmPin"] = pwmPin;
-  json["pwmFrequency"] = pwmFrequency;
-  json["pwmResolution"] = pwmResolution;
   json["reversePin"] = reversePin;
-  json["tachoPin"] = tachoPin;
 
   File configFile = SPIFFS.open(JSON_CONFIG_FILE, "w");
   if (!configFile) {
@@ -284,14 +291,13 @@ bool loadConfigFile() {
         if (!error) {
           Serial.println("\nparsed json");
 
-          if (json["switchPin"].as<int>() > 0) {
-            switchPin = json["switchPin"].as<int>();
-            pwmPin = json["pwmPin"].as<int>();
-            pwmFrequency = json["pwmFrequency"].as<int>();
-            pwmResolution = json["pwmResolution"].as<int>();
-            reversePin = json["reversePin"].as<int>();
-            tachoPin = json["tachoPin"].as<int>();
-          }
+          // TODO: reactivate when parameter page is in place
+          //       until then default values are used
+          // if (json["switchPin"].as<int>() > 0) {
+          //   switchPin = json["switchPin"].as<int>();
+          //   pwmPin = json["pwmPin"].as<int>();
+          //   reversePin = json["reversePin"].as<int>();
+          // }
 
           return true;
         }
@@ -340,7 +346,7 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
       } else if (strstr (dataStr, "slider-")) {
         int val = atoi( &dataStr[7] );
         Serial.printf("found slider value: %u \n", val);
-        ledcWrite(0, val);
+        dutyCycle = val;
       }
       ws.textAll(getState());
     }
@@ -369,6 +375,7 @@ void initWebSocket() {
   ws.onEvent(onEvent);
   server.addHandler(&ws);
 }
+
 
 void setup() {
 
@@ -415,25 +422,13 @@ void setup() {
   sprintf(convertedValue, "%d", pwmPin); // Need to convert to string to display a default value.
   WiFiManagerParameter pwm_pin_num("pwm_pin", "GPIO # for PWM", convertedValue, 7); // 7 == max length
 
-  sprintf(convertedValue, "%d", pwmFrequency); // Need to convert to string to display a default value.
-  WiFiManagerParameter pwm_frequency_num("pwm_frequency", "Max frequency of PWM GPIO", convertedValue, 7); // 7 == max length
-
-  sprintf(convertedValue, "%d", pwmResolution); // Need to convert to string to display a default value.
-  WiFiManagerParameter pwm_resolution_num("pwm_resolution", "Resolution of PWM GPIO in bits", convertedValue, 7); // 7 == max length
-
   sprintf(convertedValue, "%d", reversePin); // Need to convert to string to display a default value.
   WiFiManagerParameter reverse_pin_num("reverse_pin", "GPIO # for forward/reverse", convertedValue, 7); // 7 == max length
-
-  sprintf(convertedValue, "%d", tachoPin); // Need to convert to string to display a default value.
-  WiFiManagerParameter tacho_pin_num("tacho_pin", "GPIO # for tacho", convertedValue, 7); // 7 == max length
 
   //add all your parameters here
   wm.addParameter(&switch_pin_num);
   wm.addParameter(&pwm_pin_num);
-  wm.addParameter(&pwm_frequency_num);
-  wm.addParameter(&pwm_resolution_num);
   wm.addParameter(&reverse_pin_num);
-  wm.addParameter(&tacho_pin_num);
 
   if (forceConfig) {
     if (!wm.startConfigPortal("WifiTetris", "clock123")) {
@@ -461,19 +456,25 @@ void setup() {
   // Set outputs to LOW
   digitalWrite(switchPin, LOW);
 
+  // Initialize the output variables as outputs
+  pinMode(reversePin, OUTPUT);
+
+  // Set outputs to LOW
+  digitalWrite(reversePin, HIGH);
+
   // configure PWM functionalitites
-  ledcSetup(0, pwmFrequency, pwmResolution);
+  ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
 
   // attach the channel to the GPIO to be controlled
-  ledcAttachPin(pwmPin, 0);
+  ledcAttachPin(pwmPin, PWM_CHANNEL);
 
-  pinMode(tachoPin, INPUT);
+  pinMode(PCNT_PIN, INPUT_PULLDOWN);
 
   buttonDown.attach( BUTTON_DOWN_PIN, INPUT_PULLUP ); // USE EXTERNAL PULL-UP
   buttonUp.attach( BUTTON_UP_PIN, INPUT_PULLUP ); // USE EXTERNAL PULL-UP
   // DEBOUNCE INTERVAL IN MILLISECONDS
-  buttonDown.interval(20); 
-  buttonUp.interval(20); 
+  buttonDown.interval(DEBOUNCE_TIME); 
+  buttonUp.interval(DEBOUNCE_TIME); 
 
   // INDICATE THAT THE LOW STATE CORRESPONDS TO PHYSICALLY PRESSING THE BUTTON
   buttonDown.setPressedState(LOW);
@@ -495,21 +496,9 @@ void setup() {
   Serial.print("GPIO # for pwm: ");
   Serial.println(pwmPin);
 
-  pwmFrequency = atoi(pwm_frequency_num.getValue());
-  Serial.print("Max Frequency of pwm GPIO: ");
-  Serial.println(pwmFrequency);
-
-  pwmResolution = atoi(pwm_resolution_num.getValue());
-  Serial.print("Resolution of pwm GPIO: ");
-  Serial.println(pwmResolution);
-
   reversePin = atoi(reverse_pin_num.getValue());
   Serial.print("GPIO # for forward/reverse: ");
   Serial.println(reversePin);
-
-  tachoPin = atoi(tacho_pin_num.getValue());
-  Serial.print("GPIO # for tacho: ");
-  Serial.println(tachoPin);
 
   //save the custom parameters to FS
   if (shouldSaveConfig) {
@@ -529,25 +518,12 @@ void countup() {
   InterruptCounter++;
 }
 
-void meassure(int sensorIndex) {
-  InterruptCounter = 0;
-  attachInterrupt(digitalPinToInterrupt(tachoPin), countup, RISING);
-  delay(1000);
-  detachInterrupt(digitalPinToInterrupt(tachoPin));
-  rpm = (InterruptCounter / 2) * 60;
-  rpmValue = String(rpm);
-  Serial.print("sensor: ");
-  Serial.print(sensorIndex);
-  Serial.print(" rpm read: ");
-  Serial.println(rpm);
-}
-
 
 void loop(){
   ws.cleanupClients();
-  // meassure(0);
-  // meassure(1);
+
   fsm.run();
+  
 
   buttonDown.update();
   buttonUp.update();
@@ -561,4 +537,5 @@ void loop(){
   if (buttonDown.released() || buttonUp.released()) {
     fsm.trigger(triggers::stop);
   }
+
 }
