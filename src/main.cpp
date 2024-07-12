@@ -10,6 +10,9 @@
 #include "driver/ledc.h"
 #include "driver/pcnt.h"
 #include "soc/pcnt_struct.h"
+#include <NMEA2000_esp32.h>
+#include <N2kMessages.h>
+#include <N2kMsg.h>
 #define JSON_CONFIG_FILE "/config.json"
 Bounce2::Button buttonDown = Bounce2::Button();
 Bounce2::Button buttonUp = Bounce2::Button();
@@ -17,9 +20,35 @@ Bounce2::Button buttonUp = Bounce2::Button();
 #define BUTTON_UP_PIN 22 // GIOP21 pin connected to up button
 #define DEBOUNCE_TIME 5   // the debounce time in millisecond, increase this time if it still chatters
 #define PWM_FREQUENCY 150 // the frequency that the controller is expecting
+#define MIN_FREQ 150
+#define MAX_FREQ 4000
 #define PWM_RESOLUTION 8 // in bits
 #define PWM_CHANNEL 0
 #define PCNT_PIN 25 // GIP of opto-in on sailor hat for counting speed pulses
+#define CAN_RX_PIN GPIO_NUM_34
+#define CAN_TX_PIN GPIO_NUM_32
+
+#define CzUpdatePeriod127501 10000
+#define BinaryDeviceInstance 0x04 // Instance of 127501 switch state message
+#define SwitchBankInstance 0x04   //Instance of 127502 change switch state message
+#define NumberOfSwitches 8   // change to 4 for bit switch bank
+// List here messages your device will transmit.
+const unsigned long TransmitMessages[] PROGMEM = { 127502L,130813L,0 };
+
+// Function prototypes
+void SetN2kSwitchBankCommand(tN2kMsg& , unsigned char , tN2kBinaryStatus);
+
+
+// Global Variables
+uint8_t CzRelayPinMap[] = { 23, 5, 12, 13, 18, 26, 27, 36 }; // esp32 pins driving relays i.e CzRelayPinMap[0] returns the pin number of Relay 1
+tN2kBinaryStatus CzBankStatus;
+uint8_t CzSwitchState1 = 0;
+uint8_t CzSwitchState2 = 0;
+uint8_t CzMfdDisplaySyncState1 = 0;
+uint8_t CzMfdDisplaySyncState2 = 0;
+
+tNMEA2000 *nmea2000;
+bool winchSwitchState = false;
 
 // Create AsyncWebServer object on port 80
 AsyncWebServer server(80);
@@ -74,23 +103,27 @@ String getState() {
 
 void on_break() {
   Serial.println("winch motor state: BREAKING");
-  ledcWrite(PWM_CHANNEL, 0);
+  digitalWrite(switchPin, LOW);
+  ledcWriteTone(PWM_CHANNEL, MIN_FREQ);
   ws.textAll(getState());
 }
 
 void on_spinForward() {
   Serial.println("winch motor state: spinning FORWARD");
   // reverse pin off
+  digitalWrite(switchPin, LOW);
+  ledcWriteTone(PWM_CHANNEL, MAX_FREQ * dutyCycle / 255);
   digitalWrite(reversePin, HIGH);
-  ledcWrite(PWM_CHANNEL, dutyCycle);
+  digitalWrite(switchPin, HIGH);
   ws.textAll(getState());
 }
 
 void on_spinBackward() {
   Serial.println("winch motor state: spinning BACKWARD");
+  digitalWrite(switchPin, LOW);
   digitalWrite(reversePin, LOW);
-  // reverse pin on
-  ledcWrite(PWM_CHANNEL, dutyCycle);
+  ledcWriteTone(PWM_CHANNEL, MAX_FREQ * dutyCycle / 255);
+  digitalWrite(switchPin, HIGH);
   ws.textAll(getState());
 }
 
@@ -264,6 +297,123 @@ void saveConfigCallback() {
   shouldSaveConfig = true;
 }
 
+
+void SetCZoneSwitchState127501(unsigned char DeviceInstance) {
+
+    tN2kMsg N2kMsg;
+    tN2kBinaryStatus BankStatus;
+    N2kResetBinaryStatus(BankStatus);
+    BankStatus = (BankStatus & CzMfdDisplaySyncState2) << 8; //
+    BankStatus = BankStatus | CzMfdDisplaySyncState1;
+    BankStatus = BankStatus | 0xffffffffffff0000ULL;
+    SetN2kPGN127501(N2kMsg, DeviceInstance, BankStatus);
+    nmea2000->SendMsg(N2kMsg);
+}
+
+void SetCZoneSwitchChangeRequest127502(unsigned char DeviceInstance, uint8_t SwitchIndex, bool ItemStatus)
+{
+    tN2kMsg N2kMsg;
+    //N2kResetBinaryStatus(CzBankStatus);
+    N2kSetStatusBinaryOnStatus(CzBankStatus, ItemStatus ? N2kOnOff_On : N2kOnOff_Off, SwitchIndex);
+    //send out to other N2k switching devices on network ( pgn 127502 )
+    SetN2kSwitchBankCommand(N2kMsg, SwitchBankInstance, CzBankStatus);
+    nmea2000->SendMsg(N2kMsg);
+}
+void SetN2kSwitchBankCommand(tN2kMsg& N2kMsg, unsigned char DeviceBankInstance, tN2kBinaryStatus BankStatus)
+{
+    SetN2kPGN127502(N2kMsg, DeviceBankInstance, BankStatus);
+}
+
+//*****************************************************************************
+// Change the state of the relay requested and broadcast change to other N2K switching devices
+//*****************************************************************************
+
+void SetChangeSwitchState(uint8_t SwitchIndex, bool ItemStatus) {
+
+    // Set or reset the relay
+    if (ItemStatus) {
+        Serial.println("writing pin high");
+        digitalWrite(CzRelayPinMap[SwitchIndex - 1], HIGH); // adjust SwitchIndex to CzRelayPinMap value and set or reset
+    } else {
+        Serial.println("writing pin low");
+        digitalWrite(CzRelayPinMap[SwitchIndex - 1], LOW);
+    }
+    //send out change and status to other N2k devices on network
+    SetCZoneSwitchState127501(BinaryDeviceInstance);
+    SetCZoneSwitchChangeRequest127502(SwitchBankInstance, SwitchIndex, ItemStatus);
+}
+
+//*****************************************************************************
+void ParseN2kPGN127502(const tN2kMsg& N2kMsg) {
+    tN2kOnOff State;
+    unsigned char ChangeIndex;
+    int Index = 0;
+    uint8_t DeviceBankInstance = N2kMsg.GetByte(Index);
+    if (N2kMsg.PGN != 127502L || DeviceBankInstance  != BinaryDeviceInstance) return; //Nothing to see here
+    uint16_t BankStatus = N2kMsg.Get2ByteUInt (Index);
+    //Serial.println(BankStatus);
+    for (ChangeIndex = 0; ChangeIndex < NumberOfSwitches; ChangeIndex++) {
+
+        State = (tN2kOnOff)(BankStatus & 0x03);
+        if (State != N2kOnOff_Unavailable) break; // index (0 to 7) found for switch and state
+        BankStatus >>= 2;
+    }
+    Serial.println(ChangeIndex );
+    Serial.println(State);
+
+    switch (ChangeIndex) {
+
+      case 0x00:  CzSwitchState1 ^= 0x01; // toggle state of the of switch bit
+          CzMfdDisplaySyncState1 ^= 0x01; // toggle state of the of switch bit for MDF display sync
+          SetChangeSwitchState(1, CzSwitchState1 & 0x01); // send the change out
+          break;
+
+      case 0x01:  CzSwitchState1 ^= 0x02;
+          CzMfdDisplaySyncState1 ^= 0x04;
+          SetChangeSwitchState(2, CzSwitchState1 & 0x02); // send the change out
+          break;
+
+      case 0x02:  CzSwitchState1 ^= 0x04;
+          CzMfdDisplaySyncState1 ^= 0x10;
+          SetChangeSwitchState(3, CzSwitchState1 & 0x04); // send the change out
+          break;
+
+      case 0x03:  CzSwitchState1 ^= 0x08;
+          CzMfdDisplaySyncState1 ^= 0x40;
+          SetChangeSwitchState(4, CzSwitchState1 & 0x08); // send the change out
+          break;
+          // second 4 switches 
+      case 0x04:  CzSwitchState2 ^= 0x01; // state of the four switches
+          CzMfdDisplaySyncState2 ^= 0x01; // for MDF display sync
+          SetChangeSwitchState(5, CzSwitchState2 & 0x01); // send the change out
+          break;
+      case 0x05:  CzSwitchState2 ^= 0x02;
+          CzMfdDisplaySyncState2 ^= 0x04;
+          SetChangeSwitchState(6, CzSwitchState2 & 0x02); // send the change out
+          break;
+      case 0x06:  CzSwitchState2 ^= 0x04;
+          CzMfdDisplaySyncState2 ^= 0x10;
+          SetChangeSwitchState(7, CzSwitchState2 & 0x04); // send the change out
+          break;
+      case 0x07:  CzSwitchState2 ^= 0x08;
+          CzMfdDisplaySyncState2 ^= 0x40;
+          SetChangeSwitchState(8, CzSwitchState2 & 0x08); // send the change out
+    }
+}
+
+// send periodic updates to maintain sync and as a "heatbeat" to the MFD
+
+void SendN2k(void)
+{
+    static unsigned long CzUpdate127501 = millis();
+
+
+    if (CzUpdate127501 + CzUpdatePeriod127501 < millis()) {
+        CzUpdate127501 = millis();
+        SetCZoneSwitchState127501(BinaryDeviceInstance);
+    }
+}
+
 bool loadConfigFile() {
   //clean FS, for testing
   //SPIFFS.format();
@@ -391,7 +541,7 @@ void setup() {
   WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP
   // it is a good practice to make sure your code sets wifi mode how you want it.
 
-  Serial.begin(9600);
+  Serial.begin(115200);
 
   // Set up Final State Machine
   fsm.add(transitions, num_transitions);
@@ -463,12 +613,20 @@ void setup() {
   digitalWrite(reversePin, HIGH);
 
   // configure PWM functionalitites
-  ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(PWM_CHANNEL, MIN_FREQ, PWM_RESOLUTION);
 
   // attach the channel to the GPIO to be controlled
   ledcAttachPin(pwmPin, PWM_CHANNEL);
 
   pinMode(PCNT_PIN, INPUT_PULLDOWN);
+
+  // Initialize the output variables as outputs
+  pinMode(CzRelayPinMap[0], OUTPUT);
+  digitalWrite(CzRelayPinMap[0], LOW);
+
+  // Initialize the output variables as outputs
+  pinMode(CzRelayPinMap[1], OUTPUT);
+  digitalWrite(CzRelayPinMap[1], LOW);
 
   buttonDown.attach( BUTTON_DOWN_PIN, INPUT_PULLUP ); // USE EXTERNAL PULL-UP
   buttonUp.attach( BUTTON_UP_PIN, INPUT_PULLUP ); // USE EXTERNAL PULL-UP
@@ -512,6 +670,24 @@ void setup() {
     request->send_P(200, "text/html", index_html, processor);
   });
   server.begin();
+
+  // // initialize intitial switch state
+  nmea2000 = new tNMEA2000_esp32(CAN_TX_PIN, CAN_RX_PIN);
+  N2kResetBinaryStatus(CzBankStatus);
+
+  // // setup the N2k parameters
+  nmea2000->SetN2kCANSendFrameBufSize(250);
+  nmea2000->SetN2kCANReceiveFrameBufSize(250);
+  // //Set Product information
+  nmea2000->SetProductInformation("00260001", 0001, "Switch Bank", "1.000 06/04/21", "My Yacht 8 Bit ");
+  // // Set device information
+  nmea2000->SetDeviceInformation(260001, 140, 30, 717);
+  // // NMEA2000.SetForwardStream(&Serial);
+  nmea2000->SetMode(tNMEA2000::N2km_ListenAndNode, 169);
+  nmea2000->ExtendTransmitMessages(TransmitMessages);
+  nmea2000->SetMsgHandler(ParseN2kPGN127502);
+  nmea2000->Open();
+  delay(200);
 }
 
 void countup() {
@@ -538,4 +714,6 @@ void loop(){
     fsm.trigger(triggers::stop);
   }
 
+  nmea2000->ParseMessages();
+  SendN2k();
 }
