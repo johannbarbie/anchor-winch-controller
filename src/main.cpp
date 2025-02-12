@@ -16,8 +16,12 @@
 #define JSON_CONFIG_FILE "/config.json"
 Bounce2::Button buttonDown = Bounce2::Button();
 Bounce2::Button buttonUp = Bounce2::Button();
+Bounce2::Button radioButtonDown = Bounce2::Button();
+Bounce2::Button radioButtonUp = Bounce2::Button();
 #define BUTTON_DOWN_PIN 21 // GIOP21 pin connected to down button
 #define BUTTON_UP_PIN 22 // GIOP21 pin connected to up button
+#define RADIO_BUTTON_DOWN_PIN 27 // GIOP27 pin connected to down button
+#define RADIO_BUTTON_UP_PIN 26 // GIOP26 pin connected to up button
 #define DEBOUNCE_TIME 5   // the debounce time in millisecond, increase this time if it still chatters
 #define PWM_FREQUENCY 150 // the frequency that the controller is expecting
 #define MIN_FREQ 150
@@ -40,7 +44,7 @@ void SetN2kSwitchBankCommand(tN2kMsg& , unsigned char , tN2kBinaryStatus);
 
 
 // Global Variables
-uint8_t CzRelayPinMap[] = { 23, 5, 12, 13, 18, 26, 27, 36 }; // esp32 pins driving relays i.e CzRelayPinMap[0] returns the pin number of Relay 1
+uint8_t CzRelayPinMap[] = { 23, 5, 12, 13, 18, 14, 15, 36 }; // esp32 pins driving relays i.e CzRelayPinMap[0] returns the pin number of Relay 1
 tN2kBinaryStatus CzBankStatus;
 uint8_t CzSwitchState1 = 0;
 uint8_t CzSwitchState2 = 0;
@@ -581,7 +585,7 @@ void setup() {
   wm.addParameter(&reverse_pin_num);
 
   if (forceConfig) {
-    if (!wm.startConfigPortal("WifiTetris", "clock123")) {
+    if (!wm.startConfigPortal("WifiTetris")) {//, "clock123")) {
       Serial.println("failed to connect and hit timeout");
       delay(3000);
       //reset and try again, or maybe put it to deep sleep
@@ -589,7 +593,7 @@ void setup() {
       delay(5000);
     }
   } else {
-    if (!wm.autoConnect("WifiTetris", "clock123")) {
+    if (!wm.autoConnect("WifiTetris")) {//, "clock123")) {
       Serial.println("failed to connect and hit timeout");
       delay(3000);
       // if we still have not connected restart and try all over again
@@ -637,6 +641,17 @@ void setup() {
   // INDICATE THAT THE LOW STATE CORRESPONDS TO PHYSICALLY PRESSING THE BUTTON
   buttonDown.setPressedState(LOW);
   buttonUp.setPressedState(LOW);
+
+  // do the same for radio buttons
+  radioButtonDown.attach( RADIO_BUTTON_DOWN_PIN, INPUT_PULLUP ); // USE EXTERNAL PULL-UP
+  radioButtonUp.attach( RADIO_BUTTON_UP_PIN, INPUT_PULLUP ); // USE EXTERNAL PULL-UP
+  // DEBOUNCE INTERVAL IN MILLISECONDS
+  radioButtonDown.interval(DEBOUNCE_TIME); 
+  radioButtonUp.interval(DEBOUNCE_TIME); 
+
+  // INDICATE THAT THE LOW STATE CORRESPONDS TO PHYSICALLY PRESSING THE BUTTON
+  radioButtonDown.setPressedState(LOW);
+  radioButtonUp.setPressedState(LOW);
 
   Serial.println("");
   Serial.println("WiFi connected");
@@ -703,14 +718,16 @@ void loop(){
 
   buttonDown.update();
   buttonUp.update();
+  radioButtonDown.update();
+  radioButtonUp.update();
 
-  if (buttonDown.pressed()) {
+  if (buttonDown.pressed() || radioButtonDown.pressed()) {
     fsm.trigger(triggers::forward);
   }
-  if (buttonUp.pressed()) {
+  if (buttonUp.pressed() || radioButtonUp.pressed()) {
     fsm.trigger(triggers::backward);
   }
-  if (buttonDown.released() || buttonUp.released()) {
+  if (buttonDown.released() || buttonUp.released() || radioButtonDown.released() || radioButtonUp.released()) {
     fsm.trigger(triggers::stop);
   }
 
