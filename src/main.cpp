@@ -16,135 +16,177 @@
 
 #define JSON_CONFIG_FILE "/config.json"
 
-// Bounce2 button instances
+// --------------- BUTTON INSTANCES ----------------
 Bounce2::Button buttonDown = Bounce2::Button();
-Bounce2::Button buttonUp = Bounce2::Button();
+Bounce2::Button buttonUp   = Bounce2::Button();
 Bounce2::Button radioButtonDown = Bounce2::Button();
-Bounce2::Button radioButtonUp = Bounce2::Button();
+Bounce2::Button radioButtonUp   = Bounce2::Button();
 
-// Physical pins for local and radio buttons
+// --------------- PIN DEFINITIONS ----------------
 #define BUTTON_DOWN_PIN 21
-#define BUTTON_UP_PIN 22
+#define BUTTON_UP_PIN   22
 #define RADIO_BUTTON_DOWN_PIN 27
-#define RADIO_BUTTON_UP_PIN 26
-#define DEBOUNCE_TIME 5   // ms
+#define RADIO_BUTTON_UP_PIN   26
+#define DEBOUNCE_TIME 5  // ms
 
-// PWM frequency ranges
+// PWM frequency for motor
 #define PWM_FREQUENCY 150
 #define MIN_FREQ 150
 #define MAX_FREQ 4000
-#define PWM_RESOLUTION 8 // in bits
+#define PWM_RESOLUTION 8 // bits
 #define PWM_CHANNEL 0
 
-// Pin for speed pulse counting
+// Speed pulse counting pin
 #define PCNT_PIN 25
 
 // CAN bus pins
 #define CAN_RX_PIN GPIO_NUM_34
 #define CAN_TX_PIN GPIO_NUM_32
 
-// NMEA2000 setup
+// NMEA2000 & Switch-Bank setup
 #define CzUpdatePeriod127501 10000
-#define BinaryDeviceInstance 0x04 // Instance of 127501 switch-state message
-#define SwitchBankInstance 0x04   // Instance of 127502 switch-change message
+#define BinaryDeviceInstance 0x04
+#define SwitchBankInstance 0x04
 #define NumberOfSwitches 8
 
-// We list messages our device can transmit
+// We will send these messages
 const unsigned long TransmitMessages[] PROGMEM = { 127502L, 130813L, 0 };
 
-// Forward-declaration for N2K utility function
-void SetN2kSwitchBankCommand(tN2kMsg& , unsigned char , tN2kBinaryStatus);
-
-// *** IMPORTANT CHANGE ***
-// Old pin 5 is no longer physically driven, but we keep it in the array for indexing.
-//
-// This array describes up to 8 relays; the second entry (index 1 → pin 5)
-// is now purely “virtual.” We do NOT do pinMode on it, nor do we toggle it.
+// We keep pin 5 in the array to maintain the index, but treat it as a “virtual” switch.
 uint8_t CzRelayPinMap[] = { 23, 5, 12, 13, 18, 14, 15, 36 };
 
-// For NMEA2000 statuses
+// N2K switch statuses
 tN2kBinaryStatus CzBankStatus;
 uint8_t CzSwitchState1 = 0;
 uint8_t CzSwitchState2 = 0;
 uint8_t CzMfdDisplaySyncState1 = 0;
 uint8_t CzMfdDisplaySyncState2 = 0;
 
-// Global NMEA2000 object pointer
+// Global pointer for NMEA2000 object
 tNMEA2000 *nmea2000;
 
-// For the “main switch” in the web UI (physically the 48 V motor power pin)
-bool winchSwitchState = false;
-
-// Web server on port 80
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
-
-// Physical pin for 48 V motor power
+// Pin controlling the 48 V motor power
 int switchPin = 14;
 
-// Winch PWM pin, using channel 0
+// Winch PWM pin & dutyCycle
 int pwmPin = 33;
-int dutyCycle = 15; // 0..255
+int dutyCycle = 15;  // range 0..255
 
-// Forward/reverse direction pin
+// Forward/Reverse pin
 int reversePin = 19;
 
-// For measured speed
+// For measuring speed (unused in detail but left for reference)
 int InterruptCounter, rpm;
-volatile unsigned long pulseCount = 0;  // Count of PWM pulses
+volatile unsigned long pulseCount = 0;
 
-// State machine
+// --------------- WEBSOCKET & SERVER ---------------
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");  // Declare it BEFORE using it in any function
+
+// --------------- FSM SETUP ---------------
 SimpleFSM fsm;
+
+// Forward-declare these so the FSM can reference them
+void on_off();
 void on_break();
 void on_spinForward();
 void on_spinBackward();
 
+// We have 4 states: off, break, spinForward, spinBackward
 State s[] = {
-  State("break",  on_break, NULL, NULL),
-  State("spinForward",   on_spinForward, NULL, NULL),
-  State("spinBackward",   on_spinBackward, NULL, NULL)
+  State("off",         on_off,         NULL, NULL),
+  State("break",       on_break,       NULL, NULL),
+  State("spinForward", on_spinForward, NULL, NULL),
+  State("spinBackward",on_spinBackward,NULL, NULL)
 };
 
-String getState() {
-    StaticJsonDocument<100> json;
-    int wantedpos;
-    for (int i = 0; i < (int)(sizeof(s)/sizeof(s[0])); i++) {
-      if (fsm.getState() == &s[i]) {
-         wantedpos = i;
-         break;
-      }
-    }
-    json["controllerState"] = wantedpos;
-    json["chainOut"] = 0;
-    json["rpm"] = rpm;
-    // Expose pin 14 state in the JSON
-    json["mainSwitch"] = digitalRead(switchPin);
+// The triggers we’ll use
+enum triggers {
+  toggleOn = 1,
+  toggleOff,
+  forward,
+  backward,
+  stop
+};
 
-    String response;
-    serializeJson(json, response);
-    return response;
+/*
+  OFF -> BREAK       : toggleOn
+  BREAK -> OFF       : toggleOff
+  spinForward -> OFF : toggleOff
+  spinBackward -> OFF: toggleOff
+
+  BREAK -> spinForward : forward
+  spinForward -> BREAK : stop
+  BREAK -> spinBackward: backward
+  spinBackward -> BREAK: stop
+*/
+Transition transitions[] = {
+  Transition(&s[0], &s[1], toggleOn),
+  Transition(&s[1], &s[0], toggleOff),
+  Transition(&s[2], &s[0], toggleOff),
+  Transition(&s[3], &s[0], toggleOff),
+
+  Transition(&s[1], &s[2], forward),
+  Transition(&s[2], &s[1], stop),
+  Transition(&s[1], &s[3], backward),
+  Transition(&s[3], &s[1], stop)
+};
+
+int num_transitions = sizeof(transitions) / sizeof(Transition);
+
+// ---------------- HELPER FUNCTIONS ----------------
+String getState() {
+  StaticJsonDocument<100> json;
+  // figure out which state index we’re in
+  int wantedpos = 0;
+  for (int i = 0; i < (int)(sizeof(s)/sizeof(s[0])); i++) {
+    if (fsm.getState() == &s[i]) {
+       wantedpos = i;
+       break;
+    }
+  }
+  // Provide some relevant data
+  json["controllerState"] = wantedpos;
+  json["chainOut"] = 0; // example placeholder
+  json["rpm"]     = rpm;
+  json["mainSwitch"] = (wantedpos != 0); 
+  // If we are in state 0 ("off"), mainSwitch = false; else true
+
+  String response;
+  serializeJson(json, response);
+  return response;
+}
+
+// ---------- FSM STATE CALLBACKS ----------
+void on_off() {
+  Serial.println("FSM state: OFF");
+  digitalWrite(switchPin, LOW);           // fully off
+  ledcWriteTone(PWM_CHANNEL, MIN_FREQ);   // ensure minimal PWM
+  // now we can notify all web clients
+  ws.textAll(getState());
 }
 
 void on_break() {
-  Serial.println("winch motor state: BREAKING");
-  // Turn off motor
+  Serial.println("FSM state: BREAK");
+  // system is on but motor is not spinning
   digitalWrite(switchPin, LOW);
   ledcWriteTone(PWM_CHANNEL, MIN_FREQ);
   ws.textAll(getState());
 }
 
 void on_spinForward() {
-  Serial.println("winch motor state: spinning FORWARD");
+  Serial.println("FSM state: spinning FORWARD");
   // reverse pin off
   digitalWrite(switchPin, LOW);
   ledcWriteTone(PWM_CHANNEL, MAX_FREQ * dutyCycle / 255);
   digitalWrite(reversePin, HIGH);
+  // Now engage motor power
   digitalWrite(switchPin, HIGH);
   ws.textAll(getState());
 }
 
 void on_spinBackward() {
-  Serial.println("winch motor state: spinning BACKWARD");
+  Serial.println("FSM state: spinning BACKWARD");
   digitalWrite(switchPin, LOW);
   digitalWrite(reversePin, LOW);
   ledcWriteTone(PWM_CHANNEL, MAX_FREQ * dutyCycle / 255);
@@ -152,25 +194,7 @@ void on_spinBackward() {
   ws.textAll(getState());
 }
 
-enum triggers {
-  forward = 1,
-  backward = 2,
-  stop = 3
-};
-
-Transition transitions[] = {
-  Transition(&s[0], &s[1], forward),
-  Transition(&s[1], &s[0], stop),
-  Transition(&s[0], &s[2], backward),
-  Transition(&s[2], &s[0], stop)
-};
-
-int num_transitions = sizeof(transitions) / sizeof(Transition);
-
-// Wi-Fi config
-bool shouldSaveConfig = false;
-
-// Web UI
+// --------------- HTML PAGE ---------------
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html>
   <head>
@@ -186,40 +210,22 @@ const char index_html[] PROGMEM = R"rawliteral(
       body {max-width: 400px; margin:0px auto; padding-bottom: 25px;}
       .slider { -webkit-appearance: none; margin: 14px; width: 360px; height: 25px; background: #FFD65C;
         outline: none; -webkit-transition: .2s; transition: opacity .2s;}
-      .slider::-webkit-slider-thumb {-webkit-appearance: none; appearance: none; width: 35px; height: 35px; background: #003249; cursor: pointer;}
-      .slider::-moz-range-thumb { width: 35px; height: 35px; background: #003249; cursor: pointer; } 
-      button {padding: 15px 50px;font-size: 24px;text-align: center;outline: none;color: #fff;background-color: #0f8b8d;border: none;
-        border-radius: 5px;-webkit-touch-callout: none;-webkit-user-select: none;-khtml-user-select: none;-moz-user-select: none;
-        -ms-user-select: none;user-select: none;-webkit-tap-highlight-color: rgba(0,0,0,0);}
-      button:disabled,button[disabled]{background-color: #cccccc;color: #666666;}
-      .switch {
-        position: relative;
-        display: inline-block;
-        width: 60px;
-        height: 34px;
+      .slider::-webkit-slider-thumb {
+        -webkit-appearance: none; appearance: none; width: 35px; height: 35px;
+        background: #003249; cursor: pointer;
       }
-      .switch input {opacity: 0; width: 0; height: 0;}
-      .slider {
-        position: absolute;
-        cursor: pointer;
-        top: 0; left: 0; right: 0; bottom: 0;
-        background-color: #ccc;
-        -webkit-transition: .4s;
-        transition: .4s;
+      .slider::-moz-range-thumb {
+        width: 35px; height: 35px; background: #003249; cursor: pointer;
+      } 
+      button {
+        padding: 15px 50px; font-size: 24px; text-align: center; outline: none;
+        color: #fff; background-color: #0f8b8d; border: none; border-radius: 5px;
+        -webkit-touch-callout: none; -webkit-user-select: none; -khtml-user-select: none;
+        -moz-user-select: none; -ms-user-select: none; user-select: none;
+        -webkit-tap-highlight-color: rgba(0,0,0,0);
       }
-      .slider:before {
-        position: absolute; content: "";
-        height: 26px; width: 26px; left: 4px; bottom: 4px;
-        background-color: white;
-        -webkit-transition: .4s;
-        transition: .4s;
-      }
-      input:checked + .slider {background-color: #2196F3;}
-      input:focus + .slider {box-shadow: 0 0 1px #2196F3;}
-      input:checked + .slider:before {
-        -webkit-transform: translateX(26px);
-        -ms-transform: translateX(26px);
-        transform: translateX(26px);
+      button:disabled,button[disabled] {
+        background-color: #cccccc; color: #666666;
       }
     </style>
   </head>
@@ -257,21 +263,24 @@ const char index_html[] PROGMEM = R"rawliteral(
         document.getElementById("winchRPM").textContent = state.rpm;
         document.getElementById("chainOut").textContent = state.chainOut;
 
-        // 0 = stop, 1 = forward, 2 = backward
-        if (state.controllerState == 0) {
-          document.getElementById('buttonUp').disabled = false;
+        // 0=off, 1=break, 2=spinForward, 3=spinBackward
+        if (state.controllerState == 1) {        // break
+          document.getElementById('buttonUp').disabled   = false;
           document.getElementById('buttonDown').disabled = false;
-        }
-        if (state.controllerState == 1) {
-          document.getElementById('buttonUp').disabled = true;
+        } else if (state.controllerState == 2) { // spinForward
+          document.getElementById('buttonUp').disabled   = true;
           document.getElementById('buttonDown').disabled = false;
-        }
-        if (state.controllerState == 2) {
-          document.getElementById('buttonUp').disabled = false;
+        } else if (state.controllerState == 3) { // spinBackward
+          document.getElementById('buttonUp').disabled   = false;
+          document.getElementById('buttonDown').disabled = true;
+        } else {
+          // OFF
+          document.getElementById('buttonUp').disabled   = true;
           document.getElementById('buttonDown').disabled = true;
         }
         
         const switchElem = document.getElementById("mainSwitch");
+        // state.mainSwitch is boolean
         if (switchElem.checked !== Boolean(state.mainSwitch)) {
           isLocalChange = true;
           switchElem.checked = !switchElem.checked;
@@ -289,6 +298,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       }
       function toggleCheckbox(element) {
         if (!isLocalChange) {
+          // We signal "switchHigh" or "switchLow" to toggle OFF/ON
           ws.send((element.checked) ? 'switchHigh' : 'switchLow');
         }
       }
@@ -297,51 +307,55 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// Returns "checked" or "" for output state in HTML
+// Helper for dynamic placeholders
 String outputState(int output) {
-  if(digitalRead(output)){
-    return "checked";
-  } else {
-    return "";
-  }
+  return (digitalRead(output) ? "checked" : "");
 }
 
-// Dynamic placeholders in index_html
+// Fill placeholders in the HTML above
 String processor(const String& var) {
   if(var == "SPEED_PLACEHOLDER"){
-    String speed = "";
+    String speed;
     speed += "<p>PWM speed set: <span id=\"valueForPwmSlider\">" + String(dutyCycle) + "</span></p>";
-    speed += String("<p><input type=\"range\" onchange=\"updateSliderPWM(")
-      + String(pwmPin) + ", this)\" id=\"PwmSlider\" min=\"0\" max=\"255\" value=\"" 
-      + String(dutyCycle) + "\" step=\"1\" class=\"slider\"></p>";
+    speed += "<p><input type=\"range\" onchange=\"updateSliderPWM(";
+    speed += String(pwmPin);
+    speed += ", this)\" id=\"PwmSlider\" min=\"0\" max=\"255\" value=\"";
+    speed += String(dutyCycle);
+    speed += "\" step=\"1\" class=\"slider\"></p>";
     return speed;
   }
   if(var == "SWITCH_PLACEHOLDER"){
-    // This is the “main switch” for the motor power (pin 14),
-    // not to be confused with the old “power to entire controller” that was on pin 5
-    String buttons = "";
-    buttons += "<h4>State of Main Switch</h4><label class=\"switch\">"
-               "<input type=\"checkbox\" onchange=\"toggleCheckbox(this)\" id=\"mainSwitch\" "
-               + outputState(switchPin)
-               + "><span class=\"slider\"></span></label>";
+    // This is the "Main Switch" for toggling OFF/ON in the FSM
+    String buttons;
+    buttons  = "<h4>State of Main Switch</h4>";
+    buttons += "<label class=\"switch\">";
+    buttons += "<input type=\"checkbox\" onchange=\"toggleCheckbox(this)\" id=\"mainSwitch\">";
+    buttons += "<span class=\"slider\"></span>";
+    buttons += "</label>";
     return buttons;
   }
   return String();
 }
 
-// Save config to SPIFFS
+// ----------- SPIFFS CONFIG STORAGE -----------
+bool shouldSaveConfig = false;
+void saveConfigCallback() {
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
+
 void saveConfigFile() {
   Serial.println(F("Saving config"));
   StaticJsonDocument<512> json;
   json["switchPin"] = switchPin;
-  json["pwmPin"] = pwmPin;
+  json["pwmPin"]    = pwmPin;
   json["reversePin"] = reversePin;
 
   File configFile = SPIFFS.open(JSON_CONFIG_FILE, "w");
   if (!configFile) {
     Serial.println("failed to open config file for writing");
+    return;
   }
-
   serializeJsonPretty(json, Serial);
   if (serializeJson(json, configFile) == 0) {
     Serial.println(F("Failed to write to file"));
@@ -349,15 +363,8 @@ void saveConfigFile() {
   configFile.close();
 }
 
-// Called when we need to save config
-void saveConfigCallback() {
-  Serial.println("Should save config");
-  shouldSaveConfig = true;
-}
-
 bool loadConfigFile() {
   Serial.println("mounting FS...");
-
   if (SPIFFS.begin(false) || SPIFFS.begin(true)) {
     Serial.println("mounted file system");
     if (SPIFFS.exists(JSON_CONFIG_FILE)) {
@@ -371,8 +378,8 @@ bool loadConfigFile() {
         if (!error) {
           Serial.println("\nparsed json");
           // If you want to load from the file:
-          //switchPin = json["switchPin"].as<int>();
-          //pwmPin = json["pwmPin"].as<int>();
+          //switchPin  = json["switchPin"].as<int>();
+          //pwmPin     = json["pwmPin"].as<int>();
           //reversePin = json["reversePin"].as<int>();
           return true;
         } else {
@@ -386,7 +393,6 @@ bool loadConfigFile() {
   return false;
 }
 
-// Called when Wi-Fi manager enters config mode
 void configModeCallback(WiFiManager *myWiFiManager) {
   Serial.println("Entered Conf Mode");
   Serial.print("Config SSID: ");
@@ -395,40 +401,46 @@ void configModeCallback(WiFiManager *myWiFiManager) {
   Serial.println(WiFi.softAPIP());
 }
 
+// ----------- WEBSOCKET CALLBACK -----------
 void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
   AwsFrameInfo *info = (AwsFrameInfo*)arg;
   if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
     data[len] = 0;
     char* dataStr = (char*)data;
+    
+    if (strcmp(dataStr, "getStatus") == 0) {
+      // Just send current state
+      ws.textAll(getState());
+      return;
+    }
 
     if (strcmp(dataStr, "down") == 0) {
-      fsm.trigger(triggers::forward);
+      fsm.trigger(forward);
     } else if (strcmp(dataStr, "up") == 0) {
-      fsm.trigger(triggers::backward);
+      fsm.trigger(backward);
     } else if (strcmp(dataStr, "stop") == 0) {
-      fsm.trigger(triggers::stop);
-    } else {
-      if (strcmp(dataStr, "switchHigh") == 0) {
-        digitalWrite(switchPin, HIGH);
-      } else if (strcmp(dataStr, "switchLow") == 0) {
-        digitalWrite(switchPin, LOW);
-      } else if (strstr (dataStr, "slider-")) {
-        int val = atoi(&dataStr[7]);
-        Serial.printf("found slider value: %u \n", val);
-        dutyCycle = val;
-      }
-      ws.textAll(getState());
+      fsm.trigger(stop);
+    } else if (strcmp(dataStr, "switchHigh") == 0) {
+      fsm.trigger(toggleOn);   // OFF -> ON
+    } else if (strcmp(dataStr, "switchLow") == 0) {
+      fsm.trigger(toggleOff);  // ON -> OFF
+    } else if (strstr(dataStr, "slider-")) {
+      int val = atoi(&dataStr[7]);
+      Serial.printf("found slider value: %u \n", val);
+      dutyCycle = val;
     }
+
+    // After processing, send updated state to all clients
+    ws.textAll(getState());
   }
 }
 
-void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
-             void *arg, uint8_t *data, size_t len) {
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+             AwsEventType type, void *arg, uint8_t *data, size_t len) {
   switch (type) {
     case WS_EVT_CONNECT:
       Serial.printf("WebSocket client #%u connected from %s\n",
-                     client->id(),
-                     client->remoteIP().toString().c_str());
+                    client->id(), client->remoteIP().toString().c_str());
       break;
     case WS_EVT_DISCONNECT:
       Serial.printf("WebSocket client #%u disconnected\n", client->id());
@@ -442,138 +454,135 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
   }
 }
 
+// Initialize WebSocket and the main page route
 void initWebSocket() {
   ws.onEvent(onEvent);
   server.addHandler(&ws);
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html, processor);
+  });
 }
 
-// NMEA2000 messages for switch states
+// --------------- N2K SWITCH HANDLING ---------------
+void SetN2kSwitchBankCommand(tN2kMsg& N2kMsg, unsigned char DeviceBankInstance, tN2kBinaryStatus BankStatus) {
+  SetN2kPGN127502(N2kMsg, DeviceBankInstance, BankStatus);
+}
+
 void SetCZoneSwitchState127501(unsigned char DeviceInstance) {
-    tN2kMsg N2kMsg;
-    tN2kBinaryStatus BankStatus;
-    N2kResetBinaryStatus(BankStatus);
-    // combine high and low parts for MFD sync
-    BankStatus = (BankStatus & CzMfdDisplaySyncState2) << 8;
-    BankStatus = BankStatus | CzMfdDisplaySyncState1;
-    BankStatus = BankStatus | 0xffffffffffff0000ULL;
-    SetN2kPGN127501(N2kMsg, DeviceInstance, BankStatus);
-    nmea2000->SendMsg(N2kMsg);
+  tN2kMsg N2kMsg;
+  tN2kBinaryStatus BankStatus;
+  N2kResetBinaryStatus(BankStatus);
+
+  BankStatus = (BankStatus & CzMfdDisplaySyncState2) << 8;
+  BankStatus = BankStatus | CzMfdDisplaySyncState1;
+  BankStatus = BankStatus | 0xffffffffffff0000ULL;
+
+  SetN2kPGN127501(N2kMsg, DeviceInstance, BankStatus);
+  nmea2000->SendMsg(N2kMsg);
 }
 
 void SetCZoneSwitchChangeRequest127502(unsigned char DeviceInstance, uint8_t SwitchIndex, bool ItemStatus) {
-    tN2kMsg N2kMsg;
-    N2kSetStatusBinaryOnStatus(CzBankStatus,
-                               ItemStatus ? N2kOnOff_On : N2kOnOff_Off,
-                               SwitchIndex);
-    SetN2kSwitchBankCommand(N2kMsg, SwitchBankInstance, CzBankStatus);
-    nmea2000->SendMsg(N2kMsg);
+  tN2kMsg N2kMsg;
+  N2kSetStatusBinaryOnStatus(CzBankStatus,
+                             ItemStatus ? N2kOnOff_On : N2kOnOff_Off,
+                             SwitchIndex);
+  SetN2kSwitchBankCommand(N2kMsg, SwitchBankInstance, CzBankStatus);
+  nmea2000->SendMsg(N2kMsg);
 }
 
-void SetN2kSwitchBankCommand(tN2kMsg& N2kMsg, unsigned char DeviceBankInstance, tN2kBinaryStatus BankStatus) {
-    SetN2kPGN127502(N2kMsg, DeviceBankInstance, BankStatus);
-}
-
-// *** UPDATED FUNCTION ***
-// Now if SwitchIndex == 2 (the old relay on pin 5), we do NOT physically drive any pin.
-// The switch remains purely virtual, but we still broadcast the changed state on N2K.
+// If SwitchIndex == 2, skip physically toggling pin 5 (virtual switch)
 void SetChangeSwitchState(uint8_t SwitchIndex, bool ItemStatus) {
-    // If this is the “virtual” switch #2 (old pin 5), skip hardware:
-    if (SwitchIndex == 2) {
-      Serial.println("Switch #2 is now virtual only, no physical pin toggle.");
+  if (SwitchIndex == 2) {
+    Serial.println("Switch #2 is now virtual only, no physical pin toggle.");
+  } else {
+    if (ItemStatus) {
+      Serial.println("writing pin high");
+      digitalWrite(CzRelayPinMap[SwitchIndex - 1], HIGH);
     } else {
-      // All other switches still physically toggle
-      if (ItemStatus) {
-          Serial.println("writing pin high");
-          digitalWrite(CzRelayPinMap[SwitchIndex - 1], HIGH);
-      } else {
-          Serial.println("writing pin low");
-          digitalWrite(CzRelayPinMap[SwitchIndex - 1], LOW);
-      }
+      Serial.println("writing pin low");
+      digitalWrite(CzRelayPinMap[SwitchIndex - 1], LOW);
     }
-
-    // Now inform the network
-    SetCZoneSwitchState127501(BinaryDeviceInstance);
-    SetCZoneSwitchChangeRequest127502(SwitchBankInstance, SwitchIndex, ItemStatus);
+  }
+  // broadcast the updated states
+  SetCZoneSwitchState127501(BinaryDeviceInstance);
+  SetCZoneSwitchChangeRequest127502(SwitchBankInstance, SwitchIndex, ItemStatus);
 }
 
-// Called for PGN127502 messages
 void ParseN2kPGN127502(const tN2kMsg& N2kMsg) {
-    tN2kOnOff State;
-    unsigned char ChangeIndex;
-    int Index = 0;
-    uint8_t DeviceBankInstance = N2kMsg.GetByte(Index);
+  tN2kOnOff State;
+  unsigned char ChangeIndex;
+  int Index = 0;
+  uint8_t DeviceBankInstance = N2kMsg.GetByte(Index);
 
-    if (N2kMsg.PGN != 127502L || DeviceBankInstance != BinaryDeviceInstance) {
-      return;
-    }
+  if (N2kMsg.PGN != 127502L || DeviceBankInstance != BinaryDeviceInstance) {
+    return;
+  }
 
-    uint16_t BankStatus = N2kMsg.Get2ByteUInt(Index);
-    for (ChangeIndex = 0; ChangeIndex < NumberOfSwitches; ChangeIndex++) {
-        State = (tN2kOnOff)(BankStatus & 0x03);
-        if (State != N2kOnOff_Unavailable) break;
-        BankStatus >>= 2;
-    }
+  uint16_t BankStatus = N2kMsg.Get2ByteUInt(Index);
+  for (ChangeIndex = 0; ChangeIndex < NumberOfSwitches; ChangeIndex++) {
+    State = (tN2kOnOff)(BankStatus & 0x03);
+    if (State != N2kOnOff_Unavailable) break;
+    BankStatus >>= 2;
+  }
 
-    Serial.println(ChangeIndex);
-    Serial.println(State);
+  Serial.println(ChangeIndex);
+  Serial.println(State);
 
-    switch (ChangeIndex) {
-      case 0x00:  // Switch #1
-        CzSwitchState1 ^= 0x01;
-        CzMfdDisplaySyncState1 ^= 0x01;
-        SetChangeSwitchState(1, CzSwitchState1 & 0x01);
-        break;
-      case 0x01:  // Switch #2
-        CzSwitchState1 ^= 0x02;
-        CzMfdDisplaySyncState1 ^= 0x04;
-        SetChangeSwitchState(2, CzSwitchState1 & 0x02);
-        break;
-      case 0x02:
-        CzSwitchState1 ^= 0x04;
-        CzMfdDisplaySyncState1 ^= 0x10;
-        SetChangeSwitchState(3, CzSwitchState1 & 0x04);
-        break;
-      case 0x03:
-        CzSwitchState1 ^= 0x08;
-        CzMfdDisplaySyncState1 ^= 0x40;
-        SetChangeSwitchState(4, CzSwitchState1 & 0x08);
-        break;
-      case 0x04:
-        CzSwitchState2 ^= 0x01;
-        CzMfdDisplaySyncState2 ^= 0x01;
-        SetChangeSwitchState(5, CzSwitchState2 & 0x01);
-        break;
-      case 0x05:
-        CzSwitchState2 ^= 0x02;
-        CzMfdDisplaySyncState2 ^= 0x04;
-        SetChangeSwitchState(6, CzSwitchState2 & 0x02);
-        break;
-      case 0x06:
-        CzSwitchState2 ^= 0x04;
-        CzMfdDisplaySyncState2 ^= 0x10;
-        SetChangeSwitchState(7, CzSwitchState2 & 0x04);
-        break;
-      case 0x07:
-        CzSwitchState2 ^= 0x08;
-        CzMfdDisplaySyncState2 ^= 0x40;
-        SetChangeSwitchState(8, CzSwitchState2 & 0x08);
-        break;
-    }
+  switch (ChangeIndex) {
+    case 0x00: // Switch #1
+      CzSwitchState1 ^= 0x01;
+      CzMfdDisplaySyncState1 ^= 0x01;
+      SetChangeSwitchState(1, CzSwitchState1 & 0x01);
+      break;
+    case 0x01: // Switch #2 (virtual)
+      CzSwitchState1 ^= 0x02;
+      CzMfdDisplaySyncState1 ^= 0x04;
+      SetChangeSwitchState(2, CzSwitchState1 & 0x02);
+      break;
+    case 0x02:
+      CzSwitchState1 ^= 0x04;
+      CzMfdDisplaySyncState1 ^= 0x10;
+      SetChangeSwitchState(3, CzSwitchState1 & 0x04);
+      break;
+    case 0x03:
+      CzSwitchState1 ^= 0x08;
+      CzMfdDisplaySyncState1 ^= 0x40;
+      SetChangeSwitchState(4, CzSwitchState1 & 0x08);
+      break;
+    case 0x04:
+      CzSwitchState2 ^= 0x01;
+      CzMfdDisplaySyncState2 ^= 0x01;
+      SetChangeSwitchState(5, CzSwitchState2 & 0x01);
+      break;
+    case 0x05:
+      CzSwitchState2 ^= 0x02;
+      CzMfdDisplaySyncState2 ^= 0x04;
+      SetChangeSwitchState(6, CzSwitchState2 & 0x02);
+      break;
+    case 0x06:
+      CzSwitchState2 ^= 0x04;
+      CzMfdDisplaySyncState2 ^= 0x10;
+      SetChangeSwitchState(7, CzSwitchState2 & 0x04);
+      break;
+    case 0x07:
+      CzSwitchState2 ^= 0x08;
+      CzMfdDisplaySyncState2 ^= 0x40;
+      SetChangeSwitchState(8, CzSwitchState2 & 0x08);
+      break;
+  }
 }
 
-// Periodic “heartbeat” / update
+// Periodic heartbeat
 void SendN2k(void) {
-    static unsigned long CzUpdate127501 = millis();
-    if (CzUpdate127501 + CzUpdatePeriod127501 < millis()) {
-        CzUpdate127501 = millis();
-        SetCZoneSwitchState127501(BinaryDeviceInstance);
-    }
+  static unsigned long CzUpdate127501 = millis();
+  if (CzUpdate127501 + CzUpdatePeriod127501 < millis()) {
+    CzUpdate127501 = millis();
+    SetCZoneSwitchState127501(BinaryDeviceInstance);
+  }
 }
 
-void countup() {
-  InterruptCounter++;
-}
-
+// ------------ SETUP & LOOP ------------
 void setup() {
   Serial.begin(115200);
 
@@ -589,7 +598,7 @@ void setup() {
   wm.setSaveConfigCallback(saveConfigCallback);
   wm.setAPCallback(configModeCallback);
 
-  // Example of adding extra config parameters:
+  // Optional extra config parameters
   char switch_pin_str[2];
   sprintf(switch_pin_str, "%d", switchPin);
   WiFiManagerParameter switch_pin_num("switch_pin", "GPIO # for switch", switch_pin_str, 2);
@@ -621,50 +630,41 @@ void setup() {
     }
   }
 
-  // We are connected to WiFi here
   Serial.println("WiFi connected");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
-  // Demonstration of using user config:
-  // switchPin = atoi(switch_pin_num.getValue());
-  pwmPin = atoi(pwm_pin_num.getValue());
+  // Possibly load param values from web manager
+  // switchPin  = atoi(switch_pin_num.getValue());
+  pwmPin     = atoi(pwm_pin_num.getValue());
   reversePin = atoi(reverse_pin_num.getValue());
 
   if (shouldSaveConfig) {
     saveConfigFile();
   }
 
-  // Set up the FSM
+  // ----- FSM -----
   fsm.add(transitions, num_transitions);
-  fsm.setInitialState(&s[0]);
+  fsm.setInitialState(&s[0]); // Start OFF
 
-  // --- Initialize our motor control pins ---
+  // ----- I/O PINS -----
   pinMode(switchPin, OUTPUT);
   digitalWrite(switchPin, LOW);
 
   pinMode(reversePin, OUTPUT);
   digitalWrite(reversePin, HIGH);
 
-  // Configure PWM for the motor drive
   ledcSetup(PWM_CHANNEL, MIN_FREQ, PWM_RESOLUTION);
   ledcAttachPin(pwmPin, PWM_CHANNEL);
 
-  // We do NOT drive the second relay in CzRelayPinMap (which is pin 5).
-  // Only set up the ones we still physically use. For example, here's the
-  // first item (pin 23), if you actually need it:
+  // Example: real pin for CzRelayPinMap[0]=23
   pinMode(CzRelayPinMap[0], OUTPUT);
   digitalWrite(CzRelayPinMap[0], LOW);
-
-  // *** COMMENTED OUT *** old main power on pin 5
-  // pinMode(CzRelayPinMap[1], OUTPUT);
-  // digitalWrite(CzRelayPinMap[1], LOW);
-  //
-  // If you do use other pins in CzRelayPinMap[2..etc], initialize them similarly.
+  // We do NOT do pinMode on pin 5, since that is “virtual”.
 
   pinMode(PCNT_PIN, INPUT_PULLDOWN);
 
-  // Initialize local button inputs
+  // local pushbuttons
   buttonDown.attach(BUTTON_DOWN_PIN, INPUT_PULLUP);
   buttonUp.attach(BUTTON_UP_PIN, INPUT_PULLUP);
   buttonDown.interval(DEBOUNCE_TIME);
@@ -672,7 +672,7 @@ void setup() {
   buttonDown.setPressedState(LOW);
   buttonUp.setPressedState(LOW);
 
-  // Radio button inputs
+  // radio remote
   radioButtonDown.attach(RADIO_BUTTON_DOWN_PIN, INPUT_PULLUP);
   radioButtonUp.attach(RADIO_BUTTON_UP_PIN, INPUT_PULLUP);
   radioButtonDown.interval(DEBOUNCE_TIME);
@@ -680,15 +680,11 @@ void setup() {
   radioButtonDown.setPressedState(LOW);
   radioButtonUp.setPressedState(LOW);
 
+  // WebSocket init & server start
   initWebSocket();
-
-  // Set up the main page route
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/html", index_html, processor);
-  });
   server.begin();
 
-  // --- NMEA2000 setup ---
+  // ----- NMEA2000 -----
   nmea2000 = new tNMEA2000_esp32(CAN_TX_PIN, CAN_RX_PIN);
   N2kResetBinaryStatus(CzBankStatus);
 
@@ -703,7 +699,7 @@ void setup() {
   delay(200);
 }
 
-void loop(){
+void loop() {
   ws.cleanupClients();
   fsm.run();
 
@@ -712,18 +708,18 @@ void loop(){
   radioButtonDown.update();
   radioButtonUp.update();
 
-  // If either local or radio "down" pressed
+  // Pressing "down" => forward
   if (buttonDown.pressed() || radioButtonDown.pressed()) {
-    fsm.trigger(triggers::forward);
+    fsm.trigger(forward);
   }
-  // If either local or radio "up" pressed
+  // Pressing "up" => backward
   if (buttonUp.pressed() || radioButtonUp.pressed()) {
-    fsm.trigger(triggers::backward);
+    fsm.trigger(backward);
   }
-  // Released any of them → stop
+  // Releasing => stop
   if (buttonDown.released() || buttonUp.released() ||
       radioButtonDown.released() || radioButtonUp.released()) {
-    fsm.trigger(triggers::stop);
+    fsm.trigger(stop);
   }
 
   nmea2000->ParseMessages();
