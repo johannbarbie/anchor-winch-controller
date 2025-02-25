@@ -13,69 +13,87 @@
 #include <NMEA2000_esp32.h>
 #include <N2kMessages.h>
 #include <N2kMsg.h>
+
 #define JSON_CONFIG_FILE "/config.json"
+
+// Bounce2 button instances
 Bounce2::Button buttonDown = Bounce2::Button();
 Bounce2::Button buttonUp = Bounce2::Button();
 Bounce2::Button radioButtonDown = Bounce2::Button();
 Bounce2::Button radioButtonUp = Bounce2::Button();
-#define BUTTON_DOWN_PIN 21 // GIOP21 pin connected to down button
-#define BUTTON_UP_PIN 22 // GIOP21 pin connected to up button
-#define RADIO_BUTTON_DOWN_PIN 27 // GIOP27 pin connected to down button
-#define RADIO_BUTTON_UP_PIN 26 // GIOP26 pin connected to up button
-#define DEBOUNCE_TIME 5   // the debounce time in millisecond, increase this time if it still chatters
-#define PWM_FREQUENCY 150 // the frequency that the controller is expecting
+
+// Physical pins for local and radio buttons
+#define BUTTON_DOWN_PIN 21
+#define BUTTON_UP_PIN 22
+#define RADIO_BUTTON_DOWN_PIN 27
+#define RADIO_BUTTON_UP_PIN 26
+#define DEBOUNCE_TIME 5   // ms
+
+// PWM frequency ranges
+#define PWM_FREQUENCY 150
 #define MIN_FREQ 150
 #define MAX_FREQ 4000
 #define PWM_RESOLUTION 8 // in bits
 #define PWM_CHANNEL 0
-#define PCNT_PIN 25 // GIP of opto-in on sailor hat for counting speed pulses
+
+// Pin for speed pulse counting
+#define PCNT_PIN 25
+
+// CAN bus pins
 #define CAN_RX_PIN GPIO_NUM_34
 #define CAN_TX_PIN GPIO_NUM_32
 
+// NMEA2000 setup
 #define CzUpdatePeriod127501 10000
-#define BinaryDeviceInstance 0x04 // Instance of 127501 switch state message
-#define SwitchBankInstance 0x04   //Instance of 127502 change switch state message
-#define NumberOfSwitches 8   // change to 4 for bit switch bank
-// List here messages your device will transmit.
-const unsigned long TransmitMessages[] PROGMEM = { 127502L,130813L,0 };
+#define BinaryDeviceInstance 0x04 // Instance of 127501 switch-state message
+#define SwitchBankInstance 0x04   // Instance of 127502 switch-change message
+#define NumberOfSwitches 8
 
-// Function prototypes
+// We list messages our device can transmit
+const unsigned long TransmitMessages[] PROGMEM = { 127502L, 130813L, 0 };
+
+// Forward-declaration for N2K utility function
 void SetN2kSwitchBankCommand(tN2kMsg& , unsigned char , tN2kBinaryStatus);
 
+// *** IMPORTANT CHANGE ***
+// Old pin 5 is no longer physically driven, but we keep it in the array for indexing.
+//
+// This array describes up to 8 relays; the second entry (index 1 → pin 5)
+// is now purely “virtual.” We do NOT do pinMode on it, nor do we toggle it.
+uint8_t CzRelayPinMap[] = { 23, 5, 12, 13, 18, 14, 15, 36 };
 
-// Global Variables
-uint8_t CzRelayPinMap[] = { 23, 5, 12, 13, 18, 14, 15, 36 }; // esp32 pins driving relays i.e CzRelayPinMap[0] returns the pin number of Relay 1
+// For NMEA2000 statuses
 tN2kBinaryStatus CzBankStatus;
 uint8_t CzSwitchState1 = 0;
 uint8_t CzSwitchState2 = 0;
 uint8_t CzMfdDisplaySyncState1 = 0;
 uint8_t CzMfdDisplaySyncState2 = 0;
 
+// Global NMEA2000 object pointer
 tNMEA2000 *nmea2000;
+
+// For the “main switch” in the web UI (physically the 48 V motor power pin)
 bool winchSwitchState = false;
 
-// Create AsyncWebServer object on port 80
+// Web server on port 80
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-// GPIO pin of 48V winch power
+// Physical pin for 48 V motor power
 int switchPin = 14;
 
-
-// setting PWM properties
-// the GPIO number of the winch PWM
-// we use the opto-out of the sailor hat
+// Winch PWM pin, using channel 0
 int pwmPin = 33;
-int dutyCycle = 15; // a value from 0 to 255
+int dutyCycle = 15; // 0..255
 
-// forward / reverse
+// Forward/reverse direction pin
 int reversePin = 19;
 
-
+// For measured speed
 int InterruptCounter, rpm;
 volatile unsigned long pulseCount = 0;  // Count of PWM pulses
 
-// final state machine to manage different
+// State machine
 SimpleFSM fsm;
 void on_break();
 void on_spinForward();
@@ -90,16 +108,18 @@ State s[] = {
 String getState() {
     StaticJsonDocument<100> json;
     int wantedpos;
-    for (int i = 0; i < sizeof(s); i++) {
+    for (int i = 0; i < (int)(sizeof(s)/sizeof(s[0])); i++) {
       if (fsm.getState() == &s[i]) {
          wantedpos = i;
          break;
-      }   
+      }
     }
     json["controllerState"] = wantedpos;
     json["chainOut"] = 0;
     json["rpm"] = rpm;
+    // Expose pin 14 state in the JSON
     json["mainSwitch"] = digitalRead(switchPin);
+
     String response;
     serializeJson(json, response);
     return response;
@@ -107,6 +127,7 @@ String getState() {
 
 void on_break() {
   Serial.println("winch motor state: BREAKING");
+  // Turn off motor
   digitalWrite(switchPin, LOW);
   ledcWriteTone(PWM_CHANNEL, MIN_FREQ);
   ws.textAll(getState());
@@ -146,14 +167,10 @@ Transition transitions[] = {
 
 int num_transitions = sizeof(transitions) / sizeof(Transition);
 
-// Current time
-unsigned long currentTime = millis();
-// Previous time
-unsigned long previousTime = 0; 
-
-//flag for saving data
+// Wi-Fi config
 bool shouldSaveConfig = false;
 
+// Web UI
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html>
   <head>
@@ -175,6 +192,35 @@ const char index_html[] PROGMEM = R"rawliteral(
         border-radius: 5px;-webkit-touch-callout: none;-webkit-user-select: none;-khtml-user-select: none;-moz-user-select: none;
         -ms-user-select: none;user-select: none;-webkit-tap-highlight-color: rgba(0,0,0,0);}
       button:disabled,button[disabled]{background-color: #cccccc;color: #666666;}
+      .switch {
+        position: relative;
+        display: inline-block;
+        width: 60px;
+        height: 34px;
+      }
+      .switch input {opacity: 0; width: 0; height: 0;}
+      .slider {
+        position: absolute;
+        cursor: pointer;
+        top: 0; left: 0; right: 0; bottom: 0;
+        background-color: #ccc;
+        -webkit-transition: .4s;
+        transition: .4s;
+      }
+      .slider:before {
+        position: absolute; content: "";
+        height: 26px; width: 26px; left: 4px; bottom: 4px;
+        background-color: white;
+        -webkit-transition: .4s;
+        transition: .4s;
+      }
+      input:checked + .slider {background-color: #2196F3;}
+      input:focus + .slider {box-shadow: 0 0 1px #2196F3;}
+      input:checked + .slider:before {
+        -webkit-transform: translateX(26px);
+        -ms-transform: translateX(26px);
+        transform: translateX(26px);
+      }
     </style>
   </head>
   <body>
@@ -195,7 +241,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         ws = new WebSocket(gateway);
         ws.onopen    = onOpen;
         ws.onclose   = onClose;
-        ws.onmessage = onMessage; // <-- add this line
+        ws.onmessage = onMessage;
       }
       function onOpen(event) {
         console.log('Connection opened');
@@ -208,17 +254,19 @@ const char index_html[] PROGMEM = R"rawliteral(
       function onMessage(event) {
         console.log(event.data);
         const state = JSON.parse(event.data);
-        document.getElementById("winchRPM").textContent=state.rpm;
-        document.getElementById("chainOut").textContent=state.chainOut;
-        if (state.controllerState == 0) { // stop
+        document.getElementById("winchRPM").textContent = state.rpm;
+        document.getElementById("chainOut").textContent = state.chainOut;
+
+        // 0 = stop, 1 = forward, 2 = backward
+        if (state.controllerState == 0) {
           document.getElementById('buttonUp').disabled = false;
           document.getElementById('buttonDown').disabled = false;
         }
-        if (state.controllerState == 1) { // forward
+        if (state.controllerState == 1) {
           document.getElementById('buttonUp').disabled = true;
           document.getElementById('buttonDown').disabled = false;
         }
-        if (state.controllerState == 2) { // backward
+        if (state.controllerState == 2) {
           document.getElementById('buttonUp').disabled = false;
           document.getElementById('buttonDown').disabled = true;
         }
@@ -249,33 +297,39 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-
+// Returns "checked" or "" for output state in HTML
 String outputState(int output) {
   if(digitalRead(output)){
     return "checked";
-  }
-  else {
+  } else {
     return "";
   }
 }
 
-// Replaces placeholders with dynamic html in the control page
+// Dynamic placeholders in index_html
 String processor(const String& var) {
-  //Serial.println(var);
   if(var == "SPEED_PLACEHOLDER"){
     String speed = "";
     speed += "<p>PWM speed set: <span id=\"valueForPwmSlider\">" + String(dutyCycle) + "</span></p>";
-    speed += String("<p><input type=\"range\" onchange=\"updateSliderPWM(") + String(pwmPin) + ", this)\" id=\"PwmSlider\" min=\"0\" max=\"255\" value=\"" + String(dutyCycle) + "\" step=\"1\" class=\"slider\"></p>";
+    speed += String("<p><input type=\"range\" onchange=\"updateSliderPWM(")
+      + String(pwmPin) + ", this)\" id=\"PwmSlider\" min=\"0\" max=\"255\" value=\"" 
+      + String(dutyCycle) + "\" step=\"1\" class=\"slider\"></p>";
     return speed;
   }
   if(var == "SWITCH_PLACEHOLDER"){
+    // This is the “main switch” for the motor power (pin 14),
+    // not to be confused with the old “power to entire controller” that was on pin 5
     String buttons = "";
-    buttons += "<h4>State of Main Switch</h4><label class=\"switch\"><input type=\"checkbox\" onchange=\"toggleCheckbox(this)\" id=\"mainSwitch\" " + outputState(switchPin) + "><span class=\"slider\"></span></label>";
+    buttons += "<h4>State of Main Switch</h4><label class=\"switch\">"
+               "<input type=\"checkbox\" onchange=\"toggleCheckbox(this)\" id=\"mainSwitch\" "
+               + outputState(switchPin)
+               + "><span class=\"slider\"></span></label>";
     return buttons;
   }
   return String();
 }
 
+// Save config to SPIFFS
 void saveConfigFile() {
   Serial.println(F("Saving config"));
   StaticJsonDocument<512> json;
@@ -295,146 +349,18 @@ void saveConfigFile() {
   configFile.close();
 }
 
-//callback notifying us of the need to save config
+// Called when we need to save config
 void saveConfigCallback() {
   Serial.println("Should save config");
   shouldSaveConfig = true;
 }
 
-
-void SetCZoneSwitchState127501(unsigned char DeviceInstance) {
-
-    tN2kMsg N2kMsg;
-    tN2kBinaryStatus BankStatus;
-    N2kResetBinaryStatus(BankStatus);
-    BankStatus = (BankStatus & CzMfdDisplaySyncState2) << 8; //
-    BankStatus = BankStatus | CzMfdDisplaySyncState1;
-    BankStatus = BankStatus | 0xffffffffffff0000ULL;
-    SetN2kPGN127501(N2kMsg, DeviceInstance, BankStatus);
-    nmea2000->SendMsg(N2kMsg);
-}
-
-void SetCZoneSwitchChangeRequest127502(unsigned char DeviceInstance, uint8_t SwitchIndex, bool ItemStatus)
-{
-    tN2kMsg N2kMsg;
-    //N2kResetBinaryStatus(CzBankStatus);
-    N2kSetStatusBinaryOnStatus(CzBankStatus, ItemStatus ? N2kOnOff_On : N2kOnOff_Off, SwitchIndex);
-    //send out to other N2k switching devices on network ( pgn 127502 )
-    SetN2kSwitchBankCommand(N2kMsg, SwitchBankInstance, CzBankStatus);
-    nmea2000->SendMsg(N2kMsg);
-}
-void SetN2kSwitchBankCommand(tN2kMsg& N2kMsg, unsigned char DeviceBankInstance, tN2kBinaryStatus BankStatus)
-{
-    SetN2kPGN127502(N2kMsg, DeviceBankInstance, BankStatus);
-}
-
-//*****************************************************************************
-// Change the state of the relay requested and broadcast change to other N2K switching devices
-//*****************************************************************************
-
-void SetChangeSwitchState(uint8_t SwitchIndex, bool ItemStatus) {
-
-    // Set or reset the relay
-    if (ItemStatus) {
-        Serial.println("writing pin high");
-        digitalWrite(CzRelayPinMap[SwitchIndex - 1], HIGH); // adjust SwitchIndex to CzRelayPinMap value and set or reset
-    } else {
-        Serial.println("writing pin low");
-        digitalWrite(CzRelayPinMap[SwitchIndex - 1], LOW);
-    }
-    //send out change and status to other N2k devices on network
-    SetCZoneSwitchState127501(BinaryDeviceInstance);
-    SetCZoneSwitchChangeRequest127502(SwitchBankInstance, SwitchIndex, ItemStatus);
-}
-
-//*****************************************************************************
-void ParseN2kPGN127502(const tN2kMsg& N2kMsg) {
-    tN2kOnOff State;
-    unsigned char ChangeIndex;
-    int Index = 0;
-    uint8_t DeviceBankInstance = N2kMsg.GetByte(Index);
-    if (N2kMsg.PGN != 127502L || DeviceBankInstance  != BinaryDeviceInstance) return; //Nothing to see here
-    uint16_t BankStatus = N2kMsg.Get2ByteUInt (Index);
-    //Serial.println(BankStatus);
-    for (ChangeIndex = 0; ChangeIndex < NumberOfSwitches; ChangeIndex++) {
-
-        State = (tN2kOnOff)(BankStatus & 0x03);
-        if (State != N2kOnOff_Unavailable) break; // index (0 to 7) found for switch and state
-        BankStatus >>= 2;
-    }
-    Serial.println(ChangeIndex );
-    Serial.println(State);
-
-    switch (ChangeIndex) {
-
-      case 0x00:  CzSwitchState1 ^= 0x01; // toggle state of the of switch bit
-          CzMfdDisplaySyncState1 ^= 0x01; // toggle state of the of switch bit for MDF display sync
-          SetChangeSwitchState(1, CzSwitchState1 & 0x01); // send the change out
-          break;
-
-      case 0x01:  CzSwitchState1 ^= 0x02;
-          CzMfdDisplaySyncState1 ^= 0x04;
-          SetChangeSwitchState(2, CzSwitchState1 & 0x02); // send the change out
-          break;
-
-      case 0x02:  CzSwitchState1 ^= 0x04;
-          CzMfdDisplaySyncState1 ^= 0x10;
-          SetChangeSwitchState(3, CzSwitchState1 & 0x04); // send the change out
-          break;
-
-      case 0x03:  CzSwitchState1 ^= 0x08;
-          CzMfdDisplaySyncState1 ^= 0x40;
-          SetChangeSwitchState(4, CzSwitchState1 & 0x08); // send the change out
-          break;
-          // second 4 switches 
-      case 0x04:  CzSwitchState2 ^= 0x01; // state of the four switches
-          CzMfdDisplaySyncState2 ^= 0x01; // for MDF display sync
-          SetChangeSwitchState(5, CzSwitchState2 & 0x01); // send the change out
-          break;
-      case 0x05:  CzSwitchState2 ^= 0x02;
-          CzMfdDisplaySyncState2 ^= 0x04;
-          SetChangeSwitchState(6, CzSwitchState2 & 0x02); // send the change out
-          break;
-      case 0x06:  CzSwitchState2 ^= 0x04;
-          CzMfdDisplaySyncState2 ^= 0x10;
-          SetChangeSwitchState(7, CzSwitchState2 & 0x04); // send the change out
-          break;
-      case 0x07:  CzSwitchState2 ^= 0x08;
-          CzMfdDisplaySyncState2 ^= 0x40;
-          SetChangeSwitchState(8, CzSwitchState2 & 0x08); // send the change out
-    }
-}
-
-// send periodic updates to maintain sync and as a "heatbeat" to the MFD
-
-void SendN2k(void)
-{
-    static unsigned long CzUpdate127501 = millis();
-
-
-    if (CzUpdate127501 + CzUpdatePeriod127501 < millis()) {
-        CzUpdate127501 = millis();
-        SetCZoneSwitchState127501(BinaryDeviceInstance);
-    }
-}
-
 bool loadConfigFile() {
-  //clean FS, for testing
-  //SPIFFS.format();
-
-  //read configuration from FS json
   Serial.println("mounting FS...");
 
-  // May need to make it begin(true) first time you are using SPIFFS
-  // NOTE: This might not be a good way to do this! begin(true) reformats the spiffs
-  // it will only get called if it fails to mount, which probably means it needs to be
-  // formatted, but maybe dont use this if you have something important saved on spiffs
-  // that can't be replaced.
-  if (SPIFFS.begin(false) || SPIFFS.begin(true))
-  {
+  if (SPIFFS.begin(false) || SPIFFS.begin(true)) {
     Serial.println("mounted file system");
     if (SPIFFS.exists(JSON_CONFIG_FILE)) {
-      //file exists, reading and loading
       Serial.println("reading config file");
       File configFile = SPIFFS.open(JSON_CONFIG_FILE, "r");
       if (configFile) {
@@ -444,48 +370,37 @@ bool loadConfigFile() {
         serializeJsonPretty(json, Serial);
         if (!error) {
           Serial.println("\nparsed json");
-
-          // TODO: reactivate when parameter page is in place
-          //       until then default values are used
-          // if (json["switchPin"].as<int>() > 0) {
-          //   switchPin = json["switchPin"].as<int>();
-          //   pwmPin = json["pwmPin"].as<int>();
-          //   reversePin = json["reversePin"].as<int>();
-          // }
-
+          // If you want to load from the file:
+          //switchPin = json["switchPin"].as<int>();
+          //pwmPin = json["pwmPin"].as<int>();
+          //reversePin = json["reversePin"].as<int>();
           return true;
-        }
-        else {
+        } else {
           Serial.println("failed to load json config");
         }
       }
     }
-  }
-  else {
+  } else {
     Serial.println("failed to mount FS");
   }
-  //end read
   return false;
 }
 
-// This gets called when the config mode is launced, might
-// be useful to update a display with this info.
+// Called when Wi-Fi manager enters config mode
 void configModeCallback(WiFiManager *myWiFiManager) {
   Serial.println("Entered Conf Mode");
-
   Serial.print("Config SSID: ");
   Serial.println(myWiFiManager->getConfigPortalSSID());
-
   Serial.print("Config IP Address: ");
   Serial.println(WiFi.softAPIP());
 }
-
 
 void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
   AwsFrameInfo *info = (AwsFrameInfo*)arg;
   if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
     data[len] = 0;
     char* dataStr = (char*)data;
+
     if (strcmp(dataStr, "down") == 0) {
       fsm.trigger(triggers::forward);
     } else if (strcmp(dataStr, "up") == 0) {
@@ -498,7 +413,7 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
       } else if (strcmp(dataStr, "switchLow") == 0) {
         digitalWrite(switchPin, LOW);
       } else if (strstr (dataStr, "slider-")) {
-        int val = atoi( &dataStr[7] );
+        int val = atoi(&dataStr[7]);
         Serial.printf("found slider value: %u \n", val);
         dutyCycle = val;
       }
@@ -511,7 +426,9 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
              void *arg, uint8_t *data, size_t len) {
   switch (type) {
     case WS_EVT_CONNECT:
-      Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+      Serial.printf("WebSocket client #%u connected from %s\n",
+                     client->id(),
+                     client->remoteIP().toString().c_str());
       break;
     case WS_EVT_DISCONNECT:
       Serial.printf("WebSocket client #%u disconnected\n", client->id());
@@ -530,174 +447,255 @@ void initWebSocket() {
   server.addHandler(&ws);
 }
 
+// NMEA2000 messages for switch states
+void SetCZoneSwitchState127501(unsigned char DeviceInstance) {
+    tN2kMsg N2kMsg;
+    tN2kBinaryStatus BankStatus;
+    N2kResetBinaryStatus(BankStatus);
+    // combine high and low parts for MFD sync
+    BankStatus = (BankStatus & CzMfdDisplaySyncState2) << 8;
+    BankStatus = BankStatus | CzMfdDisplaySyncState1;
+    BankStatus = BankStatus | 0xffffffffffff0000ULL;
+    SetN2kPGN127501(N2kMsg, DeviceInstance, BankStatus);
+    nmea2000->SendMsg(N2kMsg);
+}
+
+void SetCZoneSwitchChangeRequest127502(unsigned char DeviceInstance, uint8_t SwitchIndex, bool ItemStatus) {
+    tN2kMsg N2kMsg;
+    N2kSetStatusBinaryOnStatus(CzBankStatus,
+                               ItemStatus ? N2kOnOff_On : N2kOnOff_Off,
+                               SwitchIndex);
+    SetN2kSwitchBankCommand(N2kMsg, SwitchBankInstance, CzBankStatus);
+    nmea2000->SendMsg(N2kMsg);
+}
+
+void SetN2kSwitchBankCommand(tN2kMsg& N2kMsg, unsigned char DeviceBankInstance, tN2kBinaryStatus BankStatus) {
+    SetN2kPGN127502(N2kMsg, DeviceBankInstance, BankStatus);
+}
+
+// *** UPDATED FUNCTION ***
+// Now if SwitchIndex == 2 (the old relay on pin 5), we do NOT physically drive any pin.
+// The switch remains purely virtual, but we still broadcast the changed state on N2K.
+void SetChangeSwitchState(uint8_t SwitchIndex, bool ItemStatus) {
+    // If this is the “virtual” switch #2 (old pin 5), skip hardware:
+    if (SwitchIndex == 2) {
+      Serial.println("Switch #2 is now virtual only, no physical pin toggle.");
+    } else {
+      // All other switches still physically toggle
+      if (ItemStatus) {
+          Serial.println("writing pin high");
+          digitalWrite(CzRelayPinMap[SwitchIndex - 1], HIGH);
+      } else {
+          Serial.println("writing pin low");
+          digitalWrite(CzRelayPinMap[SwitchIndex - 1], LOW);
+      }
+    }
+
+    // Now inform the network
+    SetCZoneSwitchState127501(BinaryDeviceInstance);
+    SetCZoneSwitchChangeRequest127502(SwitchBankInstance, SwitchIndex, ItemStatus);
+}
+
+// Called for PGN127502 messages
+void ParseN2kPGN127502(const tN2kMsg& N2kMsg) {
+    tN2kOnOff State;
+    unsigned char ChangeIndex;
+    int Index = 0;
+    uint8_t DeviceBankInstance = N2kMsg.GetByte(Index);
+
+    if (N2kMsg.PGN != 127502L || DeviceBankInstance != BinaryDeviceInstance) {
+      return;
+    }
+
+    uint16_t BankStatus = N2kMsg.Get2ByteUInt(Index);
+    for (ChangeIndex = 0; ChangeIndex < NumberOfSwitches; ChangeIndex++) {
+        State = (tN2kOnOff)(BankStatus & 0x03);
+        if (State != N2kOnOff_Unavailable) break;
+        BankStatus >>= 2;
+    }
+
+    Serial.println(ChangeIndex);
+    Serial.println(State);
+
+    switch (ChangeIndex) {
+      case 0x00:  // Switch #1
+        CzSwitchState1 ^= 0x01;
+        CzMfdDisplaySyncState1 ^= 0x01;
+        SetChangeSwitchState(1, CzSwitchState1 & 0x01);
+        break;
+      case 0x01:  // Switch #2
+        CzSwitchState1 ^= 0x02;
+        CzMfdDisplaySyncState1 ^= 0x04;
+        SetChangeSwitchState(2, CzSwitchState1 & 0x02);
+        break;
+      case 0x02:
+        CzSwitchState1 ^= 0x04;
+        CzMfdDisplaySyncState1 ^= 0x10;
+        SetChangeSwitchState(3, CzSwitchState1 & 0x04);
+        break;
+      case 0x03:
+        CzSwitchState1 ^= 0x08;
+        CzMfdDisplaySyncState1 ^= 0x40;
+        SetChangeSwitchState(4, CzSwitchState1 & 0x08);
+        break;
+      case 0x04:
+        CzSwitchState2 ^= 0x01;
+        CzMfdDisplaySyncState2 ^= 0x01;
+        SetChangeSwitchState(5, CzSwitchState2 & 0x01);
+        break;
+      case 0x05:
+        CzSwitchState2 ^= 0x02;
+        CzMfdDisplaySyncState2 ^= 0x04;
+        SetChangeSwitchState(6, CzSwitchState2 & 0x02);
+        break;
+      case 0x06:
+        CzSwitchState2 ^= 0x04;
+        CzMfdDisplaySyncState2 ^= 0x10;
+        SetChangeSwitchState(7, CzSwitchState2 & 0x04);
+        break;
+      case 0x07:
+        CzSwitchState2 ^= 0x08;
+        CzMfdDisplaySyncState2 ^= 0x40;
+        SetChangeSwitchState(8, CzSwitchState2 & 0x08);
+        break;
+    }
+}
+
+// Periodic “heartbeat” / update
+void SendN2k(void) {
+    static unsigned long CzUpdate127501 = millis();
+    if (CzUpdate127501 + CzUpdatePeriod127501 < millis()) {
+        CzUpdate127501 = millis();
+        SetCZoneSwitchState127501(BinaryDeviceInstance);
+    }
+}
+
+void countup() {
+  InterruptCounter++;
+}
 
 void setup() {
+  Serial.begin(115200);
 
   bool forceConfig = false;
-
   bool spiffsSetup = loadConfigFile();
-  if (!spiffsSetup)
-  {
+  if (!spiffsSetup) {
     Serial.println(F("Forcing config mode as there is no saved config"));
     forceConfig = true;
   }
 
-  WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP
-  // it is a good practice to make sure your code sets wifi mode how you want it.
-
-  Serial.begin(115200);
-
-  // Set up Final State Machine
-  fsm.add(transitions, num_transitions);
-  fsm.setInitialState(&s[0]);
-
-  //WiFiManager, Local intialization. Once its business is done, there is no need to keep it around
+  WiFi.mode(WIFI_STA);
   WiFiManager wm;
-
-  // reset settings - wipe stored credentials for testing
-  // these are stored by the esp library
-  // wm.resetSettings();
-  //set config save notify callback
   wm.setSaveConfigCallback(saveConfigCallback);
-  //set callback that gets called when connecting to previous WiFi fails, and enters Access Point mode
   wm.setAPCallback(configModeCallback);
 
-  //--- additional Configs params ---
-
-
-  // Text boxes for params
+  // Example of adding extra config parameters:
   char switch_pin_str[2];
-  sprintf(switch_pin_str, "%d", switchPin); // Need to convert to string to display a default value.
+  sprintf(switch_pin_str, "%d", switchPin);
   WiFiManagerParameter switch_pin_num("switch_pin", "GPIO # for switch", switch_pin_str, 2);
-  Serial.print("trying to set default: ");
-  Serial.println(switchPin);
 
-  char convertedValue[6];
-  sprintf(convertedValue, "%d", pwmPin); // Need to convert to string to display a default value.
-  WiFiManagerParameter pwm_pin_num("pwm_pin", "GPIO # for PWM", convertedValue, 7); // 7 == max length
+  char convertedValue[7];
+  sprintf(convertedValue, "%d", pwmPin);
+  WiFiManagerParameter pwm_pin_num("pwm_pin", "GPIO # for PWM", convertedValue, 7);
 
-  sprintf(convertedValue, "%d", reversePin); // Need to convert to string to display a default value.
-  WiFiManagerParameter reverse_pin_num("reverse_pin", "GPIO # for forward/reverse", convertedValue, 7); // 7 == max length
+  sprintf(convertedValue, "%d", reversePin);
+  WiFiManagerParameter reverse_pin_num("reverse_pin", "GPIO # for forward/reverse", convertedValue, 7);
 
-  //add all your parameters here
   wm.addParameter(&switch_pin_num);
   wm.addParameter(&pwm_pin_num);
   wm.addParameter(&reverse_pin_num);
 
   if (forceConfig) {
-    if (!wm.startConfigPortal("WifiTetris")) {//, "clock123")) {
+    if (!wm.startConfigPortal("WifiTetris")) {
       Serial.println("failed to connect and hit timeout");
       delay(3000);
-      //reset and try again, or maybe put it to deep sleep
       ESP.restart();
       delay(5000);
     }
   } else {
-    if (!wm.autoConnect("WifiTetris")) {//, "clock123")) {
+    if (!wm.autoConnect("WifiTetris")) {
       Serial.println("failed to connect and hit timeout");
       delay(3000);
-      // if we still have not connected restart and try all over again
       ESP.restart();
       delay(5000);
     }
   }
 
-  // If we get here, we are connected to the WiFi
-
-  // Initialize the output variables as outputs
-  pinMode(switchPin, OUTPUT);
-
-  // Set outputs to LOW
-  digitalWrite(switchPin, LOW);
-
-  // Initialize the output variables as outputs
-  pinMode(reversePin, OUTPUT);
-
-  // Set outputs to LOW
-  digitalWrite(reversePin, HIGH);
-
-  // configure PWM functionalitites
-  ledcSetup(PWM_CHANNEL, MIN_FREQ, PWM_RESOLUTION);
-
-  // attach the channel to the GPIO to be controlled
-  ledcAttachPin(pwmPin, PWM_CHANNEL);
-
-  pinMode(PCNT_PIN, INPUT_PULLDOWN);
-
-  // Initialize the output variables as outputs
-  pinMode(CzRelayPinMap[0], OUTPUT);
-  digitalWrite(CzRelayPinMap[0], LOW);
-
-  // Initialize the output variables as outputs
-  pinMode(CzRelayPinMap[1], OUTPUT);
-  digitalWrite(CzRelayPinMap[1], LOW);
-
-  buttonDown.attach( BUTTON_DOWN_PIN, INPUT_PULLUP ); // USE EXTERNAL PULL-UP
-  buttonUp.attach( BUTTON_UP_PIN, INPUT_PULLUP ); // USE EXTERNAL PULL-UP
-  // DEBOUNCE INTERVAL IN MILLISECONDS
-  buttonDown.interval(DEBOUNCE_TIME); 
-  buttonUp.interval(DEBOUNCE_TIME); 
-
-  // INDICATE THAT THE LOW STATE CORRESPONDS TO PHYSICALLY PRESSING THE BUTTON
-  buttonDown.setPressedState(LOW);
-  buttonUp.setPressedState(LOW);
-
-  // do the same for radio buttons
-  radioButtonDown.attach( RADIO_BUTTON_DOWN_PIN, INPUT_PULLUP ); // USE EXTERNAL PULL-UP
-  radioButtonUp.attach( RADIO_BUTTON_UP_PIN, INPUT_PULLUP ); // USE EXTERNAL PULL-UP
-  // DEBOUNCE INTERVAL IN MILLISECONDS
-  radioButtonDown.interval(DEBOUNCE_TIME); 
-  radioButtonUp.interval(DEBOUNCE_TIME); 
-
-  // INDICATE THAT THE LOW STATE CORRESPONDS TO PHYSICALLY PRESSING THE BUTTON
-  radioButtonDown.setPressedState(LOW);
-  radioButtonUp.setPressedState(LOW);
-
-  Serial.println("");
+  // We are connected to WiFi here
   Serial.println("WiFi connected");
-  Serial.println("IP address: ");
+  Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
-  // Lets deal with the user config values
-
-  //Convert the number value
-  //switchPin = atoi(switch_pin_num.getValue());
-  Serial.print("GPIO # for switch: ");
-  Serial.println(switchPin);
-
+  // Demonstration of using user config:
+  // switchPin = atoi(switch_pin_num.getValue());
   pwmPin = atoi(pwm_pin_num.getValue());
-  Serial.print("GPIO # for pwm: ");
-  Serial.println(pwmPin);
-
   reversePin = atoi(reverse_pin_num.getValue());
-  Serial.print("GPIO # for forward/reverse: ");
-  Serial.println(reversePin);
 
-  //save the custom parameters to FS
   if (shouldSaveConfig) {
     saveConfigFile();
   }
 
+  // Set up the FSM
+  fsm.add(transitions, num_transitions);
+  fsm.setInitialState(&s[0]);
+
+  // --- Initialize our motor control pins ---
+  pinMode(switchPin, OUTPUT);
+  digitalWrite(switchPin, LOW);
+
+  pinMode(reversePin, OUTPUT);
+  digitalWrite(reversePin, HIGH);
+
+  // Configure PWM for the motor drive
+  ledcSetup(PWM_CHANNEL, MIN_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(pwmPin, PWM_CHANNEL);
+
+  // We do NOT drive the second relay in CzRelayPinMap (which is pin 5).
+  // Only set up the ones we still physically use. For example, here's the
+  // first item (pin 23), if you actually need it:
+  pinMode(CzRelayPinMap[0], OUTPUT);
+  digitalWrite(CzRelayPinMap[0], LOW);
+
+  // *** COMMENTED OUT *** old main power on pin 5
+  // pinMode(CzRelayPinMap[1], OUTPUT);
+  // digitalWrite(CzRelayPinMap[1], LOW);
+  //
+  // If you do use other pins in CzRelayPinMap[2..etc], initialize them similarly.
+
+  pinMode(PCNT_PIN, INPUT_PULLDOWN);
+
+  // Initialize local button inputs
+  buttonDown.attach(BUTTON_DOWN_PIN, INPUT_PULLUP);
+  buttonUp.attach(BUTTON_UP_PIN, INPUT_PULLUP);
+  buttonDown.interval(DEBOUNCE_TIME);
+  buttonUp.interval(DEBOUNCE_TIME);
+  buttonDown.setPressedState(LOW);
+  buttonUp.setPressedState(LOW);
+
+  // Radio button inputs
+  radioButtonDown.attach(RADIO_BUTTON_DOWN_PIN, INPUT_PULLUP);
+  radioButtonUp.attach(RADIO_BUTTON_UP_PIN, INPUT_PULLUP);
+  radioButtonDown.interval(DEBOUNCE_TIME);
+  radioButtonUp.interval(DEBOUNCE_TIME);
+  radioButtonDown.setPressedState(LOW);
+  radioButtonUp.setPressedState(LOW);
+
   initWebSocket();
 
-  // Route for root / web page
+  // Set up the main page route
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "text/html", index_html, processor);
   });
   server.begin();
 
-  // // initialize intitial switch state
+  // --- NMEA2000 setup ---
   nmea2000 = new tNMEA2000_esp32(CAN_TX_PIN, CAN_RX_PIN);
   N2kResetBinaryStatus(CzBankStatus);
 
-  // // setup the N2k parameters
   nmea2000->SetN2kCANSendFrameBufSize(250);
   nmea2000->SetN2kCANReceiveFrameBufSize(250);
-  // //Set Product information
-  nmea2000->SetProductInformation("00260001", 0001, "Switch Bank", "1.000 06/04/21", "My Yacht 8 Bit ");
-  // // Set device information
+  nmea2000->SetProductInformation("00260001", 0001, "Switch Bank", "1.000 06/04/21", "My Yacht 8 Bit");
   nmea2000->SetDeviceInformation(260001, 140, 30, 717);
-  // // NMEA2000.SetForwardStream(&Serial);
   nmea2000->SetMode(tNMEA2000::N2km_ListenAndNode, 169);
   nmea2000->ExtendTransmitMessages(TransmitMessages);
   nmea2000->SetMsgHandler(ParseN2kPGN127502);
@@ -705,32 +703,30 @@ void setup() {
   delay(200);
 }
 
-void countup() {
-  InterruptCounter++;
-}
-
-
 void loop(){
   ws.cleanupClients();
-
   fsm.run();
-  
 
   buttonDown.update();
   buttonUp.update();
   radioButtonDown.update();
   radioButtonUp.update();
 
+  // If either local or radio "down" pressed
   if (buttonDown.pressed() || radioButtonDown.pressed()) {
     fsm.trigger(triggers::forward);
   }
+  // If either local or radio "up" pressed
   if (buttonUp.pressed() || radioButtonUp.pressed()) {
     fsm.trigger(triggers::backward);
   }
-  if (buttonDown.released() || buttonUp.released() || radioButtonDown.released() || radioButtonUp.released()) {
+  // Released any of them → stop
+  if (buttonDown.released() || buttonUp.released() ||
+      radioButtonDown.released() || radioButtonUp.released()) {
     fsm.trigger(triggers::stop);
   }
 
   nmea2000->ParseMessages();
   SendN2k();
 }
+
